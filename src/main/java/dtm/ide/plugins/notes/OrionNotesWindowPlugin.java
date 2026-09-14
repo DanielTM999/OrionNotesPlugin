@@ -1,0 +1,620 @@
+package dtm.ide.plugins.notes;
+
+import dtm.ide.api.annotations.PluginReference;
+import dtm.ide.api.extension.IdeWindowAdapter;
+import dtm.ide.api.extension.NotificationContext;
+import dtm.ide.api.extension.Resource;
+import dtm.ide.api.extension.event.KeyboardEvent;
+import dtm.ide.api.extension.menu.IdeMenuBarBuilder;
+import dtm.ide.api.extension.screen.ManagedCenterTabHandle;
+import dtm.ide.api.extension.screen.ManagedCenterTabListener;
+import dtm.ide.api.extension.screen.ManagedCenterTabRequest;
+import dtm.ide.api.plugin.PluginScope;
+import dtm.ide.plugins.notes.model.NoteItem;
+import dtm.ide.plugins.notes.model.NotesSessionState;
+import dtm.ide.plugins.notes.store.NotesStore;
+import dtm.ide.plugins.notes.ui.NotesIcons;
+import dtm.ide.plugins.notes.ui.NotesPanel;
+import dtm.stools.configs.UiTokens;
+import dtm.stools.component.panels.dock.DockRegion;
+import dtm.stools.component.panels.editor.code.CodeEditor;
+import dtm.stools.component.panels.editor.code.listeners.DocumentEditListener;
+import dtm.stools.component.popup.ModernDialog;
+
+import javax.swing.JTextField;
+import javax.swing.SwingUtilities;
+import java.awt.Dimension;
+import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+@PluginReference(
+        id = "orion-notes.window",
+        name = "Orion Notes",
+        description = "Notas globais com pastas, busca, lixeira e autosave",
+        version = "1.0.0"
+)
+public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPanel.Actions {
+    private final ScheduledExecutorService ioExecutor = Executors.newSingleThreadScheduledExecutor(task -> {
+        Thread thread = new Thread(task, "Orion-Notes-IO");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final Map<String, EditorSession> editors = new ConcurrentHashMap<>();
+    private final List<String> openOrder = java.util.Collections.synchronizedList(new ArrayList<>());
+    private final Object sessionLock = new Object();
+
+    private volatile NotesStore store;
+    private volatile NotesPanel panel;
+    private volatile String panelKey;
+    private volatile String sessionContext = "no-project";
+    private volatile String activeNoteId;
+    private volatile Set<String> expandedFolderIds = Set.of();
+    private volatile String selectedItemId;
+    private volatile ScheduledFuture<?> sessionSaveFuture;
+    private volatile boolean shuttingDown;
+
+    @Override
+    public void onLoad() {
+        try {
+            Resource resource = getResource();
+            if (resource == null || resource.getSharedResourcePath() == null) {
+                throw new IOException("Resource compartilhado da IDE indisponivel");
+            }
+            store = new NotesStore(resource.getSharedResourcePath().resolve("orion-notes"));
+            sessionContext = currentSessionContext();
+            panel = createPanelOnEdt();
+            panelKey = registerToolPanel(
+                    DockRegion.RIGHT,
+                    text("tree.notes", "Notes"),
+                    NotesIcons.of(NotesIcons.NOTES, 18),
+                    panel,
+                    new Dimension(300, 0)
+            );
+            restoreSession();
+        } catch (Exception failure) {
+            notifyFailure("Nao foi possivel iniciar o bloco de notas", failure);
+        }
+    }
+
+    @Override
+    public void onUnload() {
+        shuttingDown = true;
+        ScheduledFuture<?> pendingSessionSave = sessionSaveFuture;
+        if (pendingSessionSave != null) pendingSessionSave.cancel(false);
+        for (EditorSession editor : List.copyOf(editors.values())) {
+            ScheduledFuture<?> pending = editor.pendingSave;
+            if (pending != null) pending.cancel(false);
+            saveEditor(editor, false);
+            editor.editor.removeDocumentEditListener(editor.listener);
+        }
+        saveSessionNow();
+        editors.clear();
+        openOrder.clear();
+        ioExecutor.shutdownNow();
+    }
+
+    @Override
+    public void onProjectOpen(Path projectPath) {
+        sessionContext = projectPath == null ? "no-project" : projectPath.toAbsolutePath().normalize().toString();
+        restoreSession();
+    }
+
+    @Override
+    public void contributeMenuBar(IdeMenuBarBuilder menu) {
+        menu.into("tools", tools -> tools.submenu("tools:notes", text("menu.notes", "Notes"), notes -> {
+            notes.item("tools:notes:open", text("menu.openNotes", "Open notes"), event -> openPanel());
+            notes.item("tools:notes:new", text("button.newNote", "New note"), event -> createNewNoteFromUi());
+            notes.item("tools:notes:newFolder", text("button.newFolder", "New folder"), event -> createNewFolderFromUi());
+        }));
+    }
+
+    @Override
+    public void onKeyboardEvent(KeyboardEvent event) {
+        if (event == null || !event.isPressed() || event.keyCode() != KeyEvent.VK_N) return;
+        int required = InputEvent.CTRL_DOWN_MASK | InputEvent.ALT_DOWN_MASK;
+        int blocking = InputEvent.SHIFT_DOWN_MASK | InputEvent.META_DOWN_MASK;
+        if ((event.modifiersEx() & required) == required && (event.modifiersEx() & blocking) == 0) {
+            SwingUtilities.invokeLater(this::createNewNoteFromUi);
+        }
+    }
+
+    @Override
+    public void createNote(String parentId) {
+        NotesStore current = store;
+        if (current == null) return;
+        ioExecutor.execute(() -> {
+            try {
+                NoteItem note = current.createNote(parentId);
+                SwingUtilities.invokeLater(() -> {
+                    refreshPanel();
+                    openNote(note.getId());
+                });
+            } catch (Exception failure) {
+                notifyFailure("Nao foi possivel criar a nota", failure);
+            }
+        });
+    }
+
+    private void createFolder(String parentId, String title) {
+        NotesStore current = store;
+        if (current == null) return;
+        ioExecutor.execute(() -> {
+            try {
+                current.createFolder(parentId, title);
+                SwingUtilities.invokeLater(this::refreshPanel);
+            } catch (Exception failure) {
+                notifyFailure("Nao foi possivel criar a pasta", failure);
+            }
+        });
+    }
+
+    @Override
+    public void openNote(String id) {
+        EditorSession existing = editors.get(id);
+        if (existing != null && existing.handle != null && existing.handle.isOpen()) {
+            existing.handle.select();
+            return;
+        }
+        NotesStore current = store;
+        if (current == null) return;
+        ioExecutor.execute(() -> {
+            try {
+                NotesStore.LoadedNote loaded = current.loadNote(id);
+                if (loaded.item().isDeleted()) return;
+                SwingUtilities.invokeLater(() -> openLoadedNote(loaded));
+            } catch (Exception failure) {
+                notifyFailure("Nao foi possivel abrir a nota", failure);
+            }
+        });
+    }
+
+    @Override
+    public void requestCreateFolder(String parentId) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(() -> requestCreateFolder(parentId));
+            return;
+        }
+        JTextField input = new JTextField();
+        String title = createModernInputDialogBuilder()
+                .title(text("button.newFolder", "New folder"))
+                .message(text("dialog.folderName", "Folder name:"))
+                .input(input)
+                .confirmText(text("button.create", "Create"))
+                .cancelText(text("button.cancel", "Cancel"))
+                .onValidate(context -> validateName(context.value()))
+                .show();
+        if (title != null && !title.isBlank()) {
+            createFolder(parentId, title.strip());
+        }
+    }
+
+    @Override
+    public void requestRename(String id, String currentTitle) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(() -> requestRename(id, currentTitle));
+            return;
+        }
+        JTextField input = new JTextField(currentTitle == null ? "" : currentTitle);
+        input.selectAll();
+        String title = createModernInputDialogBuilder()
+                .title(text("menu.rename", "Rename"))
+                .message(text("dialog.newTitle", "New title:"))
+                .input(input)
+                .confirmText(text("button.rename", "Rename"))
+                .cancelText(text("button.cancel", "Cancel"))
+                .onValidate(context -> validateName(context.value()))
+                .show();
+        if (title != null && !title.isBlank() && !title.strip().equals(currentTitle)) {
+            rename(id, title.strip());
+        }
+    }
+
+    private void validateName(String value) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(text("dialog.nameRequired", "Enter a name"));
+        }
+    }
+
+    private void rename(String id, String title) {
+        NotesStore current = store;
+        if (current == null) return;
+        ioExecutor.execute(() -> {
+            try {
+                NoteItem renamed = current.rename(id, title);
+                SwingUtilities.invokeLater(() -> applyMetadataUpdate(renamed));
+            } catch (Exception failure) {
+                notifyFailure("Nao foi possivel renomear o item", failure);
+            }
+        });
+    }
+
+    @Override
+    public boolean move(String id, String parentId, int order) {
+        NotesStore current = store;
+        if (current == null) return false;
+        try {
+            NoteItem moved = current.move(id, parentId, order);
+            applyMetadataUpdate(moved);
+            return true;
+        } catch (Exception failure) {
+            notifyFailure("Nao foi possivel mover o item", failure);
+            return false;
+        }
+    }
+
+    @Override
+    public void moveToTrash(String id) {
+        NotesStore current = store;
+        if (current == null) return;
+        ioExecutor.execute(() -> {
+            try {
+                current.moveToTrash(id);
+                SwingUtilities.invokeLater(() -> {
+                    closeDeletedEditors();
+                    refreshPanel();
+                    scheduleSessionSave();
+                });
+            } catch (Exception failure) {
+                notifyFailure("Nao foi possivel mover o item para a lixeira", failure);
+            }
+        });
+    }
+
+    @Override
+    public void restore(String id) {
+        NotesStore current = store;
+        if (current == null) return;
+        ioExecutor.execute(() -> {
+            try {
+                current.restore(id);
+                SwingUtilities.invokeLater(this::refreshPanel);
+            } catch (Exception failure) {
+                notifyFailure("Nao foi possivel restaurar o item", failure);
+            }
+        });
+    }
+
+    @Override
+    public void requestDeletePermanently(String id, String title) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(() -> requestDeletePermanently(id, title));
+            return;
+        }
+        java.awt.Color danger = UiTokens.danger();
+        int option = createModernDialogBuilder()
+                .type(ModernDialog.Type.QUESTION)
+                .accentColor(danger)
+                .title(text("dialog.delete.title", "Delete permanently"))
+                .message(text("dialog.delete.message", "Permanently delete") + " '" + title + "'?")
+                .option(text("button.delete", "Delete"), 0, danger, UiTokens.onColor(danger))
+                .option(text("button.cancel", "Cancel"), 1)
+                .show();
+        if (option == 0) deletePermanently(id);
+    }
+
+    private void deletePermanently(String id) {
+        NotesStore current = store;
+        if (current == null) return;
+        ioExecutor.execute(() -> {
+            try {
+                current.deletePermanently(id);
+                SwingUtilities.invokeLater(this::refreshPanel);
+            } catch (Exception failure) {
+                notifyFailure("Nao foi possivel excluir o item", failure);
+            }
+        });
+    }
+
+    @Override
+    public void requestEmptyTrash() {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(this::requestEmptyTrash);
+            return;
+        }
+        java.awt.Color danger = UiTokens.danger();
+        int option = createModernDialogBuilder()
+                .type(ModernDialog.Type.QUESTION)
+                .accentColor(danger)
+                .title(text("menu.emptyTrash", "Empty trash"))
+                .message(text("dialog.emptyTrash.message", "Permanently delete every item in the trash?"))
+                .option(text("menu.emptyTrash", "Empty trash"), 0, danger, UiTokens.onColor(danger))
+                .option(text("button.cancel", "Cancel"), 1)
+                .show();
+        if (option == 0) emptyTrash();
+    }
+
+    private void emptyTrash() {
+        NotesStore current = store;
+        if (current == null) return;
+        ioExecutor.execute(() -> {
+            try {
+                current.emptyTrash();
+                SwingUtilities.invokeLater(this::refreshPanel);
+            } catch (Exception failure) {
+                notifyFailure("Nao foi possivel esvaziar a lixeira", failure);
+            }
+        });
+    }
+
+    @Override
+    public void onTreeStateChanged(Set<String> expandedIds, String selectedItemId) {
+        this.expandedFolderIds = expandedIds == null ? Set.of() : Set.copyOf(expandedIds);
+        this.selectedItemId = selectedItemId;
+        scheduleSessionSave();
+    }
+
+    private void openLoadedNote(NotesStore.LoadedNote loaded) {
+        if (shuttingDown || loaded == null) return;
+        String noteId = loaded.item().getId();
+        EditorSession existing = editors.get(noteId);
+        if (existing != null && existing.handle != null && existing.handle.isOpen()) {
+            existing.handle.select();
+            return;
+        }
+
+        CodeEditor editor = requestEmbeddedCodeEditor(noteId + ".txt", loaded.content());
+        if (editor == null) {
+            notifyFailure("Editor de codigo indisponivel", null);
+            return;
+        }
+        editor.setFocusBorderEnabled(false);
+        EditorSession session = new EditorSession(noteId, editor, loaded.item(), loaded.content());
+        DocumentEditListener listener = new DocumentEditListener() {
+            @Override
+            public void onTextChanged() {
+                if (session.suppressEvents || session.closed.get()) return;
+                session.pendingText = editor.getText();
+                session.dirty = true;
+                scheduleEditorSave(session);
+            }
+        };
+        session.listener = listener;
+        editor.addDocumentEditListener(listener);
+        editors.put(noteId, session);
+        synchronized (openOrder) {
+            openOrder.remove(noteId);
+            openOrder.add(noteId);
+        }
+
+        ManagedCenterTabRequest request = new ManagedCenterTabRequest(
+                "orion-notes:note:" + noteId,
+                loaded.item().getTitle(),
+                editor,
+                true,
+                null,
+                new ManagedCenterTabListener() {
+                    @Override
+                    public void onSelected() {
+                        activeNoteId = noteId;
+                        selectedItemId = noteId;
+                        scheduleSessionSave();
+                    }
+
+                    @Override
+                    public void onClosed() {
+                        closeEditorSession(session);
+                    }
+                }
+        );
+        session.handle = openManagedCenterTab(request);
+        if (session.handle == null) {
+            editors.remove(noteId, session);
+            editor.removeDocumentEditListener(listener);
+            notifyFailure("Nao foi possivel abrir a aba da nota", null);
+            return;
+        }
+        activeNoteId = noteId;
+        selectedItemId = noteId;
+        refreshPanel();
+        if (panel != null) panel.restoreTreeState(expandedFolderIds, noteId);
+        editor.getTextArea().requestFocusInWindow();
+        scheduleSessionSave();
+    }
+
+    private void scheduleEditorSave(EditorSession session) {
+        ScheduledFuture<?> previous = session.pendingSave;
+        if (previous != null) previous.cancel(false);
+        session.pendingSave = ioExecutor.schedule(() -> saveEditor(session, true), 600, TimeUnit.MILLISECONDS);
+    }
+
+    private void saveEditor(EditorSession session, boolean updateUi) {
+        if (session == null || session.skipCloseSave || !session.dirty) return;
+        String text = session.pendingText == null ? "" : session.pendingText;
+        try {
+            NotesStore.SaveResult result = store.saveContent(session.noteId, text, session.revision);
+            if (result.hasConflict()) {
+                session.skipCloseSave = true;
+                if (updateUi && !shuttingDown) SwingUtilities.invokeLater(() -> handleConflict(session, result.conflictCopy()));
+                return;
+            }
+            session.revision = result.item().getRevision();
+            session.item = result.item();
+            if (java.util.Objects.equals(session.pendingText, text)) session.dirty = false;
+            if (updateUi && !shuttingDown) {
+                SwingUtilities.invokeLater(() -> {
+                    if (session.handle != null) session.handle.updateTitle(result.item().getTitle());
+                    refreshPanel();
+                });
+            }
+        } catch (Exception failure) {
+            if (!shuttingDown) notifyFailure("Nao foi possivel salvar a nota", failure);
+        }
+    }
+
+    private void handleConflict(EditorSession session, NoteItem conflict) {
+        if (session.handle != null) session.handle.close();
+        refreshPanel();
+        createNotification(new NotificationContext(
+                "Conflito de nota",
+                "A edicao local foi preservada em '" + conflict.getTitle() + "'."
+        ));
+        openNote(conflict.getId());
+    }
+
+    private void closeEditorSession(EditorSession session) {
+        if (session == null || !session.closed.compareAndSet(false, true)) return;
+        ScheduledFuture<?> pending = session.pendingSave;
+        if (pending != null) pending.cancel(false);
+        session.editor.removeDocumentEditListener(session.listener);
+        editors.remove(session.noteId, session);
+        synchronized (openOrder) {
+            openOrder.remove(session.noteId);
+        }
+        if (!session.skipCloseSave && !shuttingDown) ioExecutor.execute(() -> saveEditor(session, false));
+        if (!shuttingDown) scheduleSessionSave();
+    }
+
+    private void closeDeletedEditors() {
+        for (EditorSession editor : List.copyOf(editors.values())) {
+            if (store.find(editor.noteId).map(NoteItem::isDeleted).orElse(true) && editor.handle != null) {
+                editor.handle.close();
+            }
+        }
+    }
+
+    private void applyMetadataUpdate(NoteItem item) {
+        EditorSession editor = editors.get(item.getId());
+        if (editor != null) {
+            editor.item = item;
+            editor.revision = item.getRevision();
+            if (editor.handle != null) editor.handle.updateTitle(item.getTitle());
+        }
+        refreshPanel();
+    }
+
+    private void restoreSession() {
+        NotesStore current = store;
+        NotesPanel currentPanel = panel;
+        if (current == null || currentPanel == null || shuttingDown) return;
+        NotesSessionState state = current.loadSession(sessionContext);
+        expandedFolderIds = Set.copyOf(state.getExpandedFolderIds());
+        selectedItemId = state.getSelectedItemId();
+        activeNoteId = state.getActiveNoteId();
+        SwingUtilities.invokeLater(() -> currentPanel.restoreTreeState(expandedFolderIds, selectedItemId));
+        for (String id : state.getOpenNoteIds()) openNote(id);
+        ioExecutor.execute(() -> SwingUtilities.invokeLater(() -> {
+            EditorSession active = editors.get(activeNoteId);
+            if (active != null && active.handle != null) active.handle.select();
+        }));
+    }
+
+    private void scheduleSessionSave() {
+        if (shuttingDown || store == null) return;
+        synchronized (sessionLock) {
+            if (sessionSaveFuture != null) sessionSaveFuture.cancel(false);
+            sessionSaveFuture = ioExecutor.schedule(this::saveSessionNow, 300, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private void saveSessionNow() {
+        NotesStore current = store;
+        if (current == null) return;
+        NotesSessionState state = new NotesSessionState();
+        synchronized (openOrder) {
+            state.setOpenNoteIds(openOrder.stream().filter(editors::containsKey).toList());
+        }
+        state.setActiveNoteId(activeNoteId);
+        state.setExpandedFolderIds(new LinkedHashSet<>(expandedFolderIds));
+        state.setSelectedItemId(selectedItemId);
+        try {
+            current.saveSession(sessionContext, state);
+        } catch (IOException failure) {
+            if (!shuttingDown) notifyFailure("Nao foi possivel salvar a sessao das notas", failure);
+        }
+    }
+
+    private void refreshPanel() {
+        NotesPanel current = panel;
+        if (current == null) return;
+        if (SwingUtilities.isEventDispatchThread()) current.refresh();
+        else SwingUtilities.invokeLater(current::refresh);
+    }
+
+    private void openPanel() {
+        String key = panelKey;
+        if (key != null) requestOpenToolPanel(key);
+    }
+
+    private void createNewNoteFromUi() {
+        openPanel();
+        NotesPanel current = panel;
+        createNote(current == null ? null : current.selectedFolderId());
+    }
+
+    private void createNewFolderFromUi() {
+        openPanel();
+        NotesPanel current = panel;
+        if (current != null) current.createFolderFromUi();
+    }
+
+    private NotesPanel createPanelOnEdt() throws Exception {
+        if (SwingUtilities.isEventDispatchThread()) return new NotesPanel(store, this, this::text);
+        java.util.concurrent.atomic.AtomicReference<NotesPanel> created = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        SwingUtilities.invokeAndWait(() -> {
+            try {
+                created.set(new NotesPanel(store, this, this::text));
+            } catch (Throwable error) {
+                failure.set(error);
+            }
+        });
+        if (failure.get() instanceof Exception exception) throw exception;
+        if (failure.get() != null) throw new IllegalStateException(failure.get());
+        return created.get();
+    }
+
+    private String text(String key, String fallback) {
+        return getText(key, fallback);
+    }
+
+    private String currentSessionContext() {
+        try {
+            return getCurrentOpenedProject()
+                    .map(path -> path.toAbsolutePath().normalize().toString())
+                    .orElse("no-project");
+        } catch (RuntimeException failure) {
+            return "no-project";
+        }
+    }
+
+    private void notifyFailure(String message, Throwable failure) {
+        String detail = failure == null || failure.getMessage() == null || failure.getMessage().isBlank()
+                ? message : message + ": " + failure.getMessage();
+        SwingUtilities.invokeLater(() -> createNotification(new NotificationContext("Orion Notes", detail)));
+    }
+
+    private static final class EditorSession {
+        private final String noteId;
+        private final CodeEditor editor;
+        private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+        private volatile NoteItem item;
+        private volatile String pendingText;
+        private volatile long revision;
+        private volatile DocumentEditListener listener;
+        private volatile ManagedCenterTabHandle handle;
+        private volatile ScheduledFuture<?> pendingSave;
+        private volatile boolean suppressEvents;
+        private volatile boolean skipCloseSave;
+        private volatile boolean dirty;
+
+        private EditorSession(String noteId, CodeEditor editor, NoteItem item, String text) {
+            this.noteId = noteId;
+            this.editor = editor;
+            this.item = item;
+            this.pendingText = text;
+            this.revision = item.getRevision();
+        }
+    }
+}

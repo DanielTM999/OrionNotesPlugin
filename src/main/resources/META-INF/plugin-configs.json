@@ -1,0 +1,18 @@
+{
+  "pluginPackages": ["dtm.ide.plugins.notes"],
+  "pluginCollectionId": "orion-notes",
+  "pluginCollectionName": "Orion Notes",
+  "pluginCollectionVersion": "1.0.0",
+  "pluginCollectionDescription": "Bloco de notas integrado a Orion IDE",
+  "pluginCollectionAuthor": "Daniel",
+  "pluginMinimumAppVersion": "1.0.0",
+  "pluginLicense": "MIT",
+  "plugins": [
+    {
+      "id": "orion-notes.window",
+      "name": "Orion Notes",
+      "description": "Notas globais com pastas, busca, lixeira e autosave",
+      "version": "1.0.0"
+    }
+  ]
+}
