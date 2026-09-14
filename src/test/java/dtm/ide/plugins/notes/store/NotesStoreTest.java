@@ -9,6 +9,8 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Set;
 
@@ -66,6 +68,32 @@ class NotesStoreTest {
         assertFalse(store.find(parent.getId()).orElseThrow().isDeleted());
         assertFalse(store.find(child.getId()).orElseThrow().isDeleted());
         assertFalse(store.find(note.getId()).orElseThrow().isDeleted());
+    }
+
+    @Test
+    void permanentlyDeletesTrashWhenRetentionExpires() throws Exception {
+        NotesStore store = new NotesStore(temporaryDirectory);
+        NoteItem folder = store.createFolder(null, "Expirada");
+        NoteItem note = store.createNote(folder.getId());
+        store.saveContent(note.getId(), "conteudo", note.getRevision());
+        store.moveToTrash(folder.getId());
+        Instant deletedAt = Instant.parse(store.find(folder.getId()).orElseThrow().getDeletedAt());
+
+        assertEquals(0, store.purgeExpiredTrash(Duration.ofHours(1), deletedAt.plusSeconds(3599)));
+        assertTrue(store.find(note.getId()).isPresent());
+
+        assertEquals(2, store.purgeExpiredTrash(Duration.ofHours(1), deletedAt.plusSeconds(3600)));
+        assertTrue(store.find(folder.getId()).isEmpty());
+        assertTrue(store.find(note.getId()).isEmpty());
+        assertFalse(Files.exists(temporaryDirectory.resolve("content").resolve(note.getId() + ".note")));
+    }
+
+    @Test
+    void rejectsNonPositiveTrashRetention() throws Exception {
+        NotesStore store = new NotesStore(temporaryDirectory);
+
+        assertThrows(IllegalArgumentException.class,
+                () -> store.purgeExpiredTrash(Duration.ZERO, Instant.now()));
     }
 
     @Test

@@ -27,5 +27,11 @@
   "OrionNotesWindowPlugin.settings.title": "Orion Notes",
   "OrionNotesWindowPlugin.settings.session": "Sessao",
   "OrionNotesWindowPlugin.settings.restoreOpenNotes": "Reabrir notas da sessao anterior",
-  "OrionNotesWindowPlugin.settings.restoreOpenNotes.description": "Quando desativado, as notas permanecem fechadas ao iniciar o Orion ou abrir um projeto."
+  "OrionNotesWindowPlugin.settings.restoreOpenNotes.description": "Quando desativado, as notas permanecem fechadas ao iniciar o Orion ou abrir um projeto.",
+  "OrionNotesWindowPlugin.settings.trash": "Lixeira",
+  "OrionNotesWindowPlugin.settings.trashRetention": "Excluir itens automaticamente após",
+  "OrionNotesWindowPlugin.settings.trashRetention.hours": "hora(s)",
+  "OrionNotesWindowPlugin.settings.trashRetention.days": "dia(s)",
+  "OrionNotesWindowPlugin.settings.trashRetention.forever": "Manter para sempre",
+  "OrionNotesWindowPlugin.settings.trashRetention.description": "Itens expirados são excluídos definitivamente. O prazo mínimo é de 1 hora."
 }

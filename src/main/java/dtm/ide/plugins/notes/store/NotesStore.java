@@ -21,6 +21,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -214,6 +215,31 @@ public final class NotesStore {
         });
     }
 
+    public int purgeExpiredTrash(Duration retention, Instant now) throws IOException {
+        Objects.requireNonNull(retention, "retention");
+        Objects.requireNonNull(now, "now");
+        if (retention.isZero() || retention.isNegative()) {
+            throw new IllegalArgumentException("O prazo da lixeira deve ser positivo");
+        }
+        Instant cutoff = now.minus(retention);
+        return withFileLock(() -> {
+            index = Files.exists(indexFile) ? readIndex(indexFile) : new NotesIndex();
+            List<NoteItem> removed = index.getItems().stream()
+                    .filter(NoteItem::isDeleted)
+                    .filter(item -> isExpired(item, cutoff))
+                    .toList();
+            if (removed.isEmpty()) return 0;
+            for (NoteItem item : removed) {
+                if (item.isNote()) Files.deleteIfExists(contentPath(item.getId()));
+            }
+            Set<String> removedIds = removed.stream().map(NoteItem::getId)
+                    .collect(java.util.stream.Collectors.toSet());
+            index.getItems().removeIf(item -> removedIds.contains(item.getId()));
+            writeIndex();
+            return removed.size();
+        });
+    }
+
     public LoadedNote loadNote(String id) throws IOException {
         return withFileLock(() -> {
             index = readIndex(indexFile);
@@ -397,6 +423,14 @@ public final class NotesStore {
 
     private Optional<NoteItem> findInternal(String id) {
         return index.getItems().stream().filter(item -> Objects.equals(id, item.getId())).findFirst();
+    }
+
+    private static boolean isExpired(NoteItem item, Instant cutoff) {
+        try {
+            return !Instant.parse(item.getDeletedAt()).isAfter(cutoff);
+        } catch (RuntimeException invalidTimestamp) {
+            return false;
+        }
     }
 
     private <T> T mutate(IoSupplier<T> mutation) throws IOException {

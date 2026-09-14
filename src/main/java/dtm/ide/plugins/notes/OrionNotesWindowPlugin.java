@@ -31,6 +31,8 @@ import java.awt.event.InputEvent;
 import java.awt.event.KeyEvent;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -69,6 +71,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
     private volatile Set<String> expandedFolderIds = Set.of();
     private volatile String selectedItemId;
     private volatile ScheduledFuture<?> sessionSaveFuture;
+    private volatile ScheduledFuture<?> trashCleanupFuture;
     private volatile boolean shuttingDown;
 
     @Override
@@ -91,6 +94,8 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
                     new Dimension(300, 0)
             );
             restoreSession();
+            trashCleanupFuture = ioExecutor.scheduleWithFixedDelay(
+                    this::purgeExpiredTrash, 0, 1, TimeUnit.MINUTES);
             if (hasNewNoteArgument(getApplicationArgs())) createNote(null);
         } catch (Exception failure) {
             notifyFailure("Nao foi possivel iniciar o bloco de notas", failure);
@@ -102,6 +107,8 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         shuttingDown = true;
         ScheduledFuture<?> pendingSessionSave = sessionSaveFuture;
         if (pendingSessionSave != null) pendingSessionSave.cancel(false);
+        ScheduledFuture<?> pendingTrashCleanup = trashCleanupFuture;
+        if (pendingTrashCleanup != null) pendingTrashCleanup.cancel(false);
         for (EditorSession editor : List.copyOf(editors.values())) {
             ScheduledFuture<?> pending = editor.pendingSave;
             if (pending != null) pending.cancel(false);
@@ -131,7 +138,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
 
     @Override
     public List<PluginSettingsPage> getSettingsPages() {
-        return List.of(new NotesSettingsPage(ensureSettings(), this::text));
+        return List.of(new NotesSettingsPage(ensureSettings(), this::text, this::onSettingsChanged));
     }
 
     @Override
@@ -360,6 +367,23 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
                 notifyFailure("Nao foi possivel esvaziar a lixeira", failure);
             }
         });
+    }
+
+    private void onSettingsChanged() {
+        if (!shuttingDown) ioExecutor.execute(this::purgeExpiredTrash);
+    }
+
+    private void purgeExpiredTrash() {
+        NotesStore current = store;
+        if (current == null) return;
+        long retentionHours = ensureSettings().getTrashRetentionHours();
+        if (retentionHours == NotesSettings.KEEP_TRASH_FOREVER) return;
+        try {
+            int removed = current.purgeExpiredTrash(Duration.ofHours(retentionHours), Instant.now());
+            if (removed > 0) SwingUtilities.invokeLater(this::refreshPanel);
+        } catch (Exception failure) {
+            if (!shuttingDown) notifyFailure("Nao foi possivel limpar itens expirados da lixeira", failure);
+        }
     }
 
     @Override
