@@ -9,9 +9,12 @@ import dtm.ide.api.extension.menu.IdeMenuBarBuilder;
 import dtm.ide.api.extension.screen.ManagedCenterTabHandle;
 import dtm.ide.api.extension.screen.ManagedCenterTabListener;
 import dtm.ide.api.extension.screen.ManagedCenterTabRequest;
+import dtm.ide.api.extension.settings.PluginSettingsPage;
 import dtm.ide.api.plugin.PluginScope;
 import dtm.ide.plugins.notes.model.NoteItem;
 import dtm.ide.plugins.notes.model.NotesSessionState;
+import dtm.ide.plugins.notes.settings.NotesSettings;
+import dtm.ide.plugins.notes.settings.NotesSettingsPage;
 import dtm.ide.plugins.notes.store.NotesStore;
 import dtm.ide.plugins.notes.ui.NotesIcons;
 import dtm.ide.plugins.notes.ui.NotesPanel;
@@ -46,6 +49,8 @@ import java.util.concurrent.TimeUnit;
         version = "1.0.0"
 )
 public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPanel.Actions {
+    private static final int MAX_TAB_TITLE_LENGTH = 36;
+
     private final ScheduledExecutorService ioExecutor = Executors.newSingleThreadScheduledExecutor(task -> {
         Thread thread = new Thread(task, "Orion-Notes-IO");
         thread.setDaemon(true);
@@ -56,6 +61,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
     private final Object sessionLock = new Object();
 
     private volatile NotesStore store;
+    private volatile NotesSettings settings;
     private volatile NotesPanel panel;
     private volatile String panelKey;
     private volatile String sessionContext = "no-project";
@@ -72,7 +78,9 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
             if (resource == null || resource.getSharedResourcePath() == null) {
                 throw new IOException("Resource compartilhado da IDE indisponivel");
             }
-            store = new NotesStore(resource.getSharedResourcePath().resolve("orion-notes"));
+            Path notesRoot = resource.getSharedResourcePath().resolve("orion-notes");
+            store = new NotesStore(notesRoot);
+            settings = new NotesSettings(notesRoot);
             sessionContext = currentSessionContext();
             panel = createPanelOnEdt();
             panelKey = registerToolPanel(
@@ -83,6 +91,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
                     new Dimension(300, 0)
             );
             restoreSession();
+            if (hasNewNoteArgument(getApplicationArgs())) createNote(null);
         } catch (Exception failure) {
             notifyFailure("Nao foi possivel iniciar o bloco de notas", failure);
         }
@@ -118,6 +127,11 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
             notes.item("tools:notes:new", text("button.newNote", "New note"), event -> createNewNoteFromUi());
             notes.item("tools:notes:newFolder", text("button.newFolder", "New folder"), event -> createNewFolderFromUi());
         }));
+    }
+
+    @Override
+    public List<PluginSettingsPage> getSettingsPages() {
+        return List.of(new NotesSettingsPage(ensureSettings(), this::text));
     }
 
     @Override
@@ -390,7 +404,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
 
         ManagedCenterTabRequest request = new ManagedCenterTabRequest(
                 "orion-notes:note:" + noteId,
-                loaded.item().getTitle(),
+                tabTitle(loaded.item().getTitle()),
                 editor,
                 true,
                 null,
@@ -444,7 +458,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
             if (java.util.Objects.equals(session.pendingText, text)) session.dirty = false;
             if (updateUi && !shuttingDown) {
                 SwingUtilities.invokeLater(() -> {
-                    if (session.handle != null) session.handle.updateTitle(result.item().getTitle());
+                    if (session.handle != null) session.handle.updateTitle(tabTitle(result.item().getTitle()));
                     refreshPanel();
                 });
             }
@@ -489,7 +503,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         if (editor != null) {
             editor.item = item;
             editor.revision = item.getRevision();
-            if (editor.handle != null) editor.handle.updateTitle(item.getTitle());
+            if (editor.handle != null) editor.handle.updateTitle(tabTitle(item.getTitle()));
         }
         refreshPanel();
     }
@@ -501,13 +515,53 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         NotesSessionState state = current.loadSession(sessionContext);
         expandedFolderIds = Set.copyOf(state.getExpandedFolderIds());
         selectedItemId = state.getSelectedItemId();
-        activeNoteId = state.getActiveNoteId();
+        String restoredActiveNoteId = state.getActiveNoteId();
         SwingUtilities.invokeLater(() -> currentPanel.restoreTreeState(expandedFolderIds, selectedItemId));
-        for (String id : state.getOpenNoteIds()) openNote(id);
+        if (!ensureSettings().isRestoreOpenNotes()) {
+            activeNoteId = null;
+            return;
+        }
+        activeNoteId = restoredActiveNoteId;
+        for (String id : state.getOpenNoteIds()) {
+            if (id != null && !id.isBlank()) openNote(id);
+        }
         ioExecutor.execute(() -> SwingUtilities.invokeLater(() -> {
-            EditorSession active = editors.get(activeNoteId);
+            EditorSession active = restoredActiveNoteId == null || restoredActiveNoteId.isBlank()
+                    ? null : editors.get(restoredActiveNoteId);
             if (active != null && active.handle != null) active.handle.select();
         }));
+    }
+
+    static String tabTitle(String title) {
+        String safeTitle = title == null || title.isBlank() ? NotesStore.UNTITLED : title.strip();
+        int codePointCount = safeTitle.codePointCount(0, safeTitle.length());
+        if (codePointCount <= MAX_TAB_TITLE_LENGTH) return safeTitle;
+        int end = safeTitle.offsetByCodePoints(0, MAX_TAB_TITLE_LENGTH - 1);
+        return safeTitle.substring(0, end).stripTrailing() + "…";
+    }
+
+    static boolean hasNewNoteArgument(List<String> applicationArgs) {
+        if (applicationArgs == null) return false;
+        return applicationArgs.stream()
+                .filter(java.util.Objects::nonNull)
+                .map(String::strip)
+                .anyMatch(argument -> argument.equalsIgnoreCase("notepad") || argument.equals("-n"));
+    }
+
+    private synchronized NotesSettings ensureSettings() {
+        NotesSettings current = settings;
+        if (current != null) return current;
+        Path settingsRoot = null;
+        try {
+            Resource resource = getResource();
+            if (resource != null && resource.getSharedResourcePath() != null) {
+                settingsRoot = resource.getSharedResourcePath().resolve("orion-notes");
+            }
+        } catch (Exception ignored) {
+        }
+        current = new NotesSettings(settingsRoot);
+        settings = current;
+        return current;
     }
 
     private void scheduleSessionSave() {

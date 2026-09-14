@@ -23,5 +23,9 @@
   "OrionNotesWindowPlugin.tooltip.newFolder": "Nova pasta",
   "OrionNotesWindowPlugin.dialog.delete.title": "Excluir definitivamente",
   "OrionNotesWindowPlugin.dialog.delete.message": "Excluir definitivamente",
-  "OrionNotesWindowPlugin.dialog.emptyTrash.message": "Excluir definitivamente todos os itens da lixeira?"
+  "OrionNotesWindowPlugin.dialog.emptyTrash.message": "Excluir definitivamente todos os itens da lixeira?",
+  "OrionNotesWindowPlugin.settings.title": "Orion Notes",
+  "OrionNotesWindowPlugin.settings.session": "Sessao",
+  "OrionNotesWindowPlugin.settings.restoreOpenNotes": "Reabrir notas da sessao anterior",
+  "OrionNotesWindowPlugin.settings.restoreOpenNotes.description": "Quando desativado, as notas permanecem fechadas ao iniciar o Orion ou abrir um projeto."
 }
