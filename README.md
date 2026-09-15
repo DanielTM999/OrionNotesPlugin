@@ -1,13 +1,14 @@
 # Orion Notes
 
-Bloco de notas integrado à Orion IDE. Crie notas e pastas, pesquise pelo título ou conteúdo e mantenha suas anotações disponíveis independentemente do projeto aberto.
+Bloco de notas integrado à Orion IDE. Organize anotações globais ou privadas do projeto aberto e pesquise pelo título ou conteúdo.
 
 ## Recursos
 
 - Salvamento automático durante a edição.
 - Organização de notas em pastas, com suporte a arrastar e soltar.
+- Áreas separadas para notas globais e notas do projeto atual.
 - Pesquisa por título e conteúdo.
-- Lixeira com restauração e prazo de exclusão configurável.
+- Lixeira única para todas as áreas, com restauração e prazo de exclusão configurável.
 - Restauração opcional das notas abertas na sessão anterior.
 - Atalho `Ctrl + Alt + N` para criar uma nota.
 
@@ -43,6 +44,7 @@ Depois, use `Ferramentas > Plugins > Recarregar Plugins` ou reinicie a IDE.
 Abra `Ferramentas > Notas > Abrir notas`. O painel **Notas** será exibido à direita da IDE.
 
 - Use os botões no topo do painel para criar uma nota ou uma pasta.
+- Selecione **Global**, o projeto atual ou uma de suas pastas para escolher o destino; sem seleção, vale a preferência configurada.
 - Dê dois cliques em uma nota para abri-la no editor.
 - Clique com o botão direito em um item para renomear, restaurar ou mover para a lixeira.
 - Arraste notas e pastas para reorganizá-las.
@@ -55,6 +57,7 @@ As alterações são salvas automaticamente.
 Nas configurações da Orion, abra a página **Orion Notes** para:
 
 - reabrir as notas da sessão anterior;
+- escolher se novos itens serão criados por padrão em **Global** ou no projeto atual;
 - definir por quanto tempo os itens permanecem na lixeira;
 - manter os itens da lixeira indefinidamente.
 
@@ -62,7 +65,7 @@ Por padrão, notas abertas não são restauradas e os itens da lixeira são excl
 
 ## Onde as notas ficam armazenadas?
 
-As notas ficam na área de recursos compartilhados da Orion, dentro de `shared/orion-notes`. Elas não são gravadas no projeto aberto nem adicionadas ao controle de versão do projeto.
+Todas as notas ficam na área de recursos compartilhados da Orion, dentro de `shared/orion-notes`. Cada nota é marcada como Global ou vinculada ao caminho normalizado de um projeto. Notas de outros projetos permanecem armazenadas, mas ficam ocultas enquanto esses projetos não estiverem abertos. Nenhum arquivo é gravado dentro do projeto nem adicionado ao controle de versão.
 
 Antes de remover dados manualmente, feche a Orion. Para fazer backup, copie toda a pasta `orion-notes`.
 

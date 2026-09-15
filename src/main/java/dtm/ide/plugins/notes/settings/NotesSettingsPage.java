@@ -26,6 +26,7 @@ public final class NotesSettingsPage implements PluginSettingsPage {
     private final NotesPanel.TextResolver texts;
     private final Runnable onSettingsChanged;
     private final JCheckBox restoreOpenNotes;
+    private final JComboBox<String> defaultArea;
     private final JSpinner trashRetentionValue;
     private final JComboBox<String> trashRetentionUnit;
     private final JCheckBox keepTrashForever;
@@ -41,6 +42,10 @@ public final class NotesSettingsPage implements PluginSettingsPage {
         this.onSettingsChanged = Objects.requireNonNull(onSettingsChanged, "onSettingsChanged");
         restoreOpenNotes = new JCheckBox(text("settings.restoreOpenNotes",
                 "Reopen notes from the previous session"));
+        defaultArea = new JComboBox<>(new String[]{
+                text("settings.defaultArea.global", "Global"),
+                text("settings.defaultArea.project", "Current project")
+        });
         trashRetentionValue = new JSpinner(new SpinnerNumberModel(1L, 1L, (long) Integer.MAX_VALUE, 1L));
         trashRetentionUnit = new JComboBox<>(new String[]{
                 text("settings.trashRetention.hours", "hour(s)"),
@@ -66,6 +71,8 @@ public final class NotesSettingsPage implements PluginSettingsPage {
     @Override
     public void onApply() {
         settings.setRestoreOpenNotes(restoreOpenNotes.isSelected());
+        settings.setDefaultArea(defaultArea.getSelectedIndex() == 1
+                ? NotesSettings.DefaultArea.PROJECT : NotesSettings.DefaultArea.GLOBAL);
         settings.setTrashRetentionHours(selectedTrashRetentionHours());
         settings.save();
         onSettingsChanged.run();
@@ -106,6 +113,26 @@ public final class NotesSettingsPage implements PluginSettingsPage {
         content.add(description, constraints);
 
         constraints.gridy++;
+        constraints.insets = new Insets(20, 0, 0, 0);
+        JLabel creationTitle = new JLabel(text("settings.creation", "Creation"));
+        creationTitle.setFont(creationTitle.getFont().deriveFont(Font.BOLD, 18f));
+        content.add(creationTitle, constraints);
+
+        constraints.gridy++;
+        constraints.insets = new Insets(14, 0, 0, 0);
+        JPanel defaultDestination = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        defaultDestination.add(new JLabel(text("settings.defaultArea", "Create new items by default in")));
+        defaultDestination.add(defaultArea);
+        content.add(defaultDestination, constraints);
+
+        constraints.gridy++;
+        constraints.insets = new Insets(4, 24, 0, 0);
+        JLabel creationDescription = new JLabel(text("settings.defaultArea.description",
+                "An explicitly selected area or folder always takes precedence."));
+        if (secondary != null) creationDescription.setForeground(secondary);
+        content.add(creationDescription, constraints);
+
+        constraints.gridy++;
         constraints.insets = new Insets(28, 0, 0, 0);
         JLabel trashTitle = new JLabel(text("settings.trash", "Trash"));
         trashTitle.setFont(trashTitle.getFont().deriveFont(Font.BOLD, 18f));
@@ -142,6 +169,7 @@ public final class NotesSettingsPage implements PluginSettingsPage {
 
     private void loadFromSettings() {
         restoreOpenNotes.setSelected(settings.isRestoreOpenNotes());
+        defaultArea.setSelectedIndex(settings.getDefaultArea() == NotesSettings.DefaultArea.PROJECT ? 1 : 0);
         long hours = settings.getTrashRetentionHours();
         boolean forever = hours == NotesSettings.KEEP_TRASH_FOREVER;
         keepTrashForever.setSelected(forever);

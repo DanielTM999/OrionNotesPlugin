@@ -5,6 +5,7 @@ import java.util.Objects;
 public final class NoteItem {
     private String id;
     private NoteType type;
+    private String projectId;
     private String parentId;
     private String title;
     private TitleMode titleMode;
@@ -22,6 +23,7 @@ public final class NoteItem {
         NoteItem copy = new NoteItem();
         copy.id = id;
         copy.type = type;
+        copy.projectId = projectId;
         copy.parentId = parentId;
         copy.title = title;
         copy.titleMode = titleMode;
@@ -42,6 +44,8 @@ public final class NoteItem {
     public void setId(String id) { this.id = id; }
     public NoteType getType() { return type; }
     public void setType(NoteType type) { this.type = type; }
+    public String getProjectId() { return projectId; }
+    public void setProjectId(String projectId) { this.projectId = projectId; }
     public String getParentId() { return parentId; }
     public void setParentId(String parentId) { this.parentId = parentId; }
     public String getTitle() { return title; }

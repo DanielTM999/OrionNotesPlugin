@@ -4,7 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 public final class NotesIndex {
-    private int schemaVersion = 1;
+    private int schemaVersion = 2;
     private List<NoteItem> items = new ArrayList<>();
 
     public int getSchemaVersion() { return schemaVersion; }

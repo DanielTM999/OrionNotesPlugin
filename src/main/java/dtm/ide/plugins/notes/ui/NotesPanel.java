@@ -27,7 +27,10 @@ import java.awt.FlowLayout;
 import java.awt.Font;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -35,8 +38,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeMap;
 
 public final class NotesPanel extends JPanel {
+    private static final String GLOBAL_AREA_ID = "notes-area-global";
+    private static final String PROJECT_AREA_ID = "notes-area-project";
+
     private final NotesStore store;
     private final Actions actions;
     private final TextResolver texts;
@@ -44,12 +51,21 @@ public final class NotesPanel extends JPanel {
     private final JTextField searchField = new JTextField();
     private final Timer searchTimer;
     private final Map<String, TreeNode<Entry>> itemNodes = new HashMap<>();
+    private volatile String currentProjectId;
+    private volatile String currentProjectLabel;
 
     public NotesPanel(NotesStore store, Actions actions, TextResolver texts) {
+        this(store, actions, texts, null, null);
+    }
+
+    public NotesPanel(NotesStore store, Actions actions, TextResolver texts,
+                      String currentProjectId, String currentProjectLabel) {
         super(new BorderLayout());
         this.store = Objects.requireNonNull(store, "store");
         this.actions = Objects.requireNonNull(actions, "actions");
         this.texts = Objects.requireNonNull(texts, "texts");
+        this.currentProjectId = normalizeProjectId(currentProjectId);
+        this.currentProjectLabel = currentProjectLabel;
         this.searchTimer = new Timer(250, event -> refresh());
         this.searchTimer.setRepeats(false);
         setBackground(UiTokens.background());
@@ -59,6 +75,12 @@ public final class NotesPanel extends JPanel {
         scroll.setBorder(BorderFactory.createEmptyBorder());
         scroll.getViewport().setBackground(tree.getBackground());
         add(scroll, BorderLayout.CENTER);
+        refresh();
+    }
+
+    public void setCurrentProject(String projectId, String projectLabel) {
+        currentProjectId = normalizeProjectId(projectId);
+        currentProjectLabel = projectLabel;
         refresh();
     }
 
@@ -149,27 +171,38 @@ public final class NotesPanel extends JPanel {
     }
 
     public void refresh() {
-        Set<String> expansion = tree.getRootNode() == null ? Set.of() : tree.snapshotExpansion();
+        boolean initialLoad = tree.getRootNode() == null;
+        Set<String> expansion = initialLoad ? new LinkedHashSet<>() : tree.snapshotExpansion();
         String selected = selectedItemId();
         itemNodes.clear();
 
-        TreeNode<Entry> root = node(new Entry(EntryKind.ROOT, null, text("tree.notes", "Notes")), "notes-root");
+        TreeNode<Entry> root = node(new Entry(EntryKind.ROOT, null, text("tree.notes", "Notes"), null),
+                "notes-root");
         root.setAlwaysParent(true);
         root.setDropTarget(true);
         String query = searchField.getText() == null ? "" : searchField.getText().strip();
+        List<NoteItem> items = query.isBlank()
+                ? store.listVisible(currentProjectId) : store.searchVisible(query, currentProjectId);
+
+        TreeNode<Entry> global = areaNode(null, text("tree.global", "Global"), GLOBAL_AREA_ID);
+        appendAreaItems(global, null, items, query);
+        root.addChild(global);
+        if (initialLoad) expansion.add(GLOBAL_AREA_ID);
+
+        if (currentProjectId != null) {
+            TreeNode<Entry> project = areaNode(currentProjectId, projectLabel(), PROJECT_AREA_ID);
+            appendAreaItems(project, currentProjectId, items, query);
+            root.addChild(project);
+            if (initialLoad) expansion.add(PROJECT_AREA_ID);
+        }
+
         if (query.isBlank()) {
-            appendHierarchy(root, null, store.list(false), new HashSet<>());
-            TreeNode<Entry> trash = node(new Entry(EntryKind.TRASH, null, text("tree.trash", "Trash")), "notes-trash");
+            TreeNode<Entry> trash = node(new Entry(EntryKind.TRASH, null,
+                    text("tree.trash", "Trash"), null), "notes-trash");
             trash.setAlwaysParent(true);
             trash.setIcon(NotesIcons.of(NotesIcons.TRASH, 16));
-            appendTrash(trash, store.list(true));
+            appendTrashGroups(trash, store.listTrash());
             root.addChild(trash);
-        } else {
-            for (NoteItem item : store.search(query, false)) {
-                String breadcrumb = store.breadcrumb(item);
-                String label = breadcrumb.isBlank() ? item.getTitle() : item.getTitle() + " - " + breadcrumb;
-                root.addChild(itemNode(item, label));
-            }
         }
         tree.setRoot(root);
         tree.restoreExpansion(expansion);
@@ -177,14 +210,22 @@ public final class NotesPanel extends JPanel {
     }
 
     public void restoreTreeState(Set<String> expandedIds, String selectedId) {
-        tree.restoreExpansion(expandedIds == null ? Set.of() : expandedIds);
+        Set<String> expansion = expandedIds == null ? new LinkedHashSet<>() : new LinkedHashSet<>(expandedIds);
+        if (expansion.stream().noneMatch(id -> id.startsWith("notes-area-"))) {
+            expansion.add(GLOBAL_AREA_ID);
+            if (currentProjectId != null) expansion.add(PROJECT_AREA_ID);
+        }
+        tree.restoreExpansion(expansion);
         if (selectedId != null && itemNodes.containsKey(selectedId)) tree.selectNode(itemNodes.get(selectedId));
     }
 
     public Set<String> expandedFolderIds() {
         Set<String> result = new LinkedHashSet<>();
         for (String id : tree.snapshotExpansion()) {
-            if (itemNodes.containsKey(id) && itemNodes.get(id).getData().item().isFolder()) result.add(id);
+            if (id.startsWith("notes-area-")
+                    || itemNodes.containsKey(id) && itemNodes.get(id).getData().item().isFolder()) {
+                result.add(id);
+            }
         }
         return result;
     }
@@ -195,20 +236,24 @@ public final class NotesPanel extends JPanel {
         return selected.getData().item().getId();
     }
 
-    public String selectedFolderId() {
+    public CreationTarget selectedCreationTarget() {
         TreeNode<Entry> selected = tree.getSelectedNode();
         if (selected == null || selected.getData() == null) return null;
         Entry entry = selected.getData();
+        if (entry.kind() == EntryKind.AREA) return new CreationTarget(null, entry.projectId());
         if (entry.kind() != EntryKind.ITEM || entry.item().isDeleted()) return null;
-        return entry.item().isFolder() ? entry.item().getId() : entry.item().getParentId();
+        return new CreationTarget(entry.item().isFolder() ? entry.item().getId() : entry.item().getParentId(),
+                entry.item().getProjectId());
     }
 
     public void createNote() {
-        actions.createNote(selectedFolderId());
+        CreationTarget target = creationTarget();
+        actions.createNote(target.parentId(), target.projectId());
     }
 
     public void createFolderFromUi() {
-        actions.requestCreateFolder(selectedFolderId());
+        CreationTarget target = creationTarget();
+        actions.requestCreateFolder(target.parentId(), target.projectId());
     }
 
     private void appendHierarchy(TreeNode<Entry> parent, String parentId, List<NoteItem> items, Set<String> visited) {
@@ -230,6 +275,47 @@ public final class NotesPanel extends JPanel {
         }
     }
 
+    private TreeNode<Entry> areaNode(String projectId, String label, String id) {
+        TreeNode<Entry> area = node(new Entry(EntryKind.AREA, null, label, projectId), id);
+        area.setIcon(NotesIcons.of(NotesIcons.FOLDER, 16));
+        area.setAlwaysParent(true);
+        area.setDropTarget(true);
+        return area;
+    }
+
+    private void appendAreaItems(TreeNode<Entry> area, String projectId, List<NoteItem> items, String query) {
+        List<NoteItem> scoped = items.stream()
+                .filter(item -> Objects.equals(projectId, item.getProjectId()))
+                .toList();
+        if (query == null || query.isBlank()) {
+            appendHierarchy(area, null, scoped, new HashSet<>());
+            return;
+        }
+        for (NoteItem item : scoped) {
+            String breadcrumb = store.breadcrumb(item);
+            String label = breadcrumb.isBlank() ? item.getTitle() : item.getTitle() + " - " + breadcrumb;
+            area.addChild(itemNode(item, label));
+        }
+    }
+
+    private void appendTrashGroups(TreeNode<Entry> trash, List<NoteItem> items) {
+        Map<String, List<NoteItem>> projects = new TreeMap<>(Comparator.nullsFirst(String.CASE_INSENSITIVE_ORDER));
+        for (NoteItem item : items) {
+            projects.computeIfAbsent(item.getProjectId(), ignored -> new ArrayList<>()).add(item);
+        }
+        for (Map.Entry<String, List<NoteItem>> project : projects.entrySet()) {
+            String projectId = project.getKey();
+            String label = projectId == null ? text("tree.global", "Global") : trashProjectLabel(projectId);
+            String id = projectId == null ? "notes-trash-global"
+                    : "notes-trash-project-" + Integer.toUnsignedString(projectId.hashCode());
+            TreeNode<Entry> group = node(new Entry(EntryKind.TRASH_AREA, null, label, projectId), id);
+            group.setIcon(NotesIcons.of(NotesIcons.FOLDER, 16));
+            group.setAlwaysParent(true);
+            appendTrash(group, project.getValue());
+            trash.addChild(group);
+        }
+    }
+
     private void appendTrash(TreeNode<Entry> trash, List<NoteItem> items) {
         Set<String> deletedIds = new HashSet<>();
         for (NoteItem item : items) deletedIds.add(item.getId());
@@ -244,13 +330,38 @@ public final class NotesPanel extends JPanel {
     }
 
     private TreeNode<Entry> itemNode(NoteItem item, String label) {
-        TreeNode<Entry> node = node(new Entry(EntryKind.ITEM, item, label), item.getId());
+        TreeNode<Entry> node = node(new Entry(EntryKind.ITEM, item, label, item.getProjectId()), item.getId());
         node.setIcon(NotesIcons.of(item.isFolder() ? NotesIcons.FOLDER : NotesIcons.NOTE, 16));
         node.setDraggable(!item.isDeleted());
         node.setDropTarget(item.isFolder() && !item.isDeleted());
         node.setAlwaysParent(item.isFolder());
         itemNodes.put(item.getId(), node);
         return node;
+    }
+
+    private CreationTarget creationTarget() {
+        CreationTarget selected = selectedCreationTarget();
+        if (selected != null) return selected;
+        return new CreationTarget(null, normalizeProjectId(actions.defaultProjectId()));
+    }
+
+    private String projectLabel() {
+        if (currentProjectLabel != null && !currentProjectLabel.isBlank()) return currentProjectLabel;
+        return text("tree.project", "Current project");
+    }
+
+    private String trashProjectLabel(String projectId) {
+        String name = projectId;
+        try {
+            Path path = Path.of(projectId);
+            if (path.getFileName() != null) name = path.getFileName().toString();
+        } catch (InvalidPathException ignored) {
+        }
+        return name + " - " + projectId;
+    }
+
+    private static String normalizeProjectId(String projectId) {
+        return projectId == null || projectId.isBlank() ? null : projectId.strip();
     }
 
     private TreeNode<Entry> node(Entry entry, String id) {
@@ -263,19 +374,22 @@ public final class NotesPanel extends JPanel {
         if (context == null || context.draggedNodes().isEmpty()) return false;
         TreeNode<Entry> target = context.targetNode();
         String parentId = null;
+        String projectId = normalizeProjectId(actions.defaultProjectId());
         if (target != null && target.getData() != null) {
             Entry targetEntry = target.getData();
-            if (targetEntry.kind() == EntryKind.TRASH) return false;
+            if (targetEntry.kind() == EntryKind.TRASH || targetEntry.kind() == EntryKind.TRASH_AREA) return false;
+            if (targetEntry.kind() == EntryKind.AREA) projectId = targetEntry.projectId();
             if (targetEntry.kind() == EntryKind.ITEM) {
                 if (!targetEntry.item().isFolder() || targetEntry.item().isDeleted()) return false;
                 parentId = targetEntry.item().getId();
+                projectId = targetEntry.item().getProjectId();
             }
         }
         int order = Math.max(0, context.childIndex());
         for (TreeNode<Entry> dragged : new ArrayList<>(context.draggedNodes())) {
             Entry entry = dragged.getData();
             if (entry == null || entry.kind() != EntryKind.ITEM || entry.item().isDeleted()) return false;
-            if (!actions.move(entry.item().getId(), parentId, order++)) return false;
+            if (!actions.move(entry.item().getId(), parentId, projectId, order++)) return false;
         }
         SwingUtilities.invokeLater(this::refresh);
         return true;
@@ -290,10 +404,18 @@ public final class NotesPanel extends JPanel {
             add(menu, text("button.newFolder", "New folder"), event -> createFolderFromUi());
             return menu;
         }
+        if (entry.kind() == EntryKind.AREA) {
+            add(menu, text("button.newNote", "New note"),
+                    event -> actions.createNote(null, entry.projectId()));
+            add(menu, text("button.newFolder", "New folder"),
+                    event -> actions.requestCreateFolder(null, entry.projectId()));
+            return menu;
+        }
         if (entry.kind() == EntryKind.TRASH) {
             add(menu, text("menu.emptyTrash", "Empty trash"), event -> actions.requestEmptyTrash());
             return menu;
         }
+        if (entry.kind() == EntryKind.TRASH_AREA) return menu;
         NoteItem item = entry.item();
         if (item.isDeleted()) {
             add(menu, text("menu.restore", "Restore"), event -> actions.restore(item.getId()));
@@ -303,8 +425,10 @@ public final class NotesPanel extends JPanel {
         }
         if (item.isNote()) add(menu, text("menu.open", "Open"), event -> actions.openNote(item.getId()));
         if (item.isFolder()) {
-            add(menu, text("button.newNote", "New note"), event -> actions.createNote(item.getId()));
-            add(menu, text("button.newFolder", "New folder"), event -> actions.requestCreateFolder(item.getId()));
+            add(menu, text("button.newNote", "New note"),
+                    event -> actions.createNote(item.getId(), item.getProjectId()));
+            add(menu, text("button.newFolder", "New folder"),
+                    event -> actions.requestCreateFolder(item.getId(), item.getProjectId()));
         }
         add(menu, text("menu.rename", "Rename"), event -> actions.requestRename(item.getId(), item.getTitle()));
         add(menu, text("menu.moveToTrash", "Move to trash"), event -> actions.moveToTrash(item.getId()));
@@ -322,16 +446,17 @@ public final class NotesPanel extends JPanel {
     }
 
     public interface Actions {
-        void createNote(String parentId);
-        void requestCreateFolder(String parentId);
+        void createNote(String parentId, String projectId);
+        void requestCreateFolder(String parentId, String projectId);
         void openNote(String id);
         void requestRename(String id, String currentTitle);
-        boolean move(String id, String parentId, int order);
+        boolean move(String id, String parentId, String projectId, int order);
         void moveToTrash(String id);
         void restore(String id);
         void requestDeletePermanently(String id, String title);
         void requestEmptyTrash();
         void onTreeStateChanged(Set<String> expandedIds, String selectedItemId);
+        String defaultProjectId();
     }
 
     @FunctionalInterface
@@ -341,10 +466,15 @@ public final class NotesPanel extends JPanel {
 
     private enum EntryKind {
         ROOT,
+        AREA,
         ITEM,
-        TRASH
+        TRASH,
+        TRASH_AREA
     }
 
-    private record Entry(EntryKind kind, NoteItem item, String label) {
+    public record CreationTarget(String parentId, String projectId) {
+    }
+
+    private record Entry(EntryKind kind, NoteItem item, String label, String projectId) {
     }
 }

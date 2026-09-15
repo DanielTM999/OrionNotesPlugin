@@ -11,7 +11,7 @@
     {
       "id": "orion-notes.window",
       "name": "Orion Notes",
-      "description": "Notas globais com pastas, busca, lixeira e autosave",
+      "description": "Notas globais e por projeto com pastas, busca, lixeira e autosave",
       "version": "1.0.0"
     }
   ]

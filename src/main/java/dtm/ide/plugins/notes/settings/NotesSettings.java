@@ -18,10 +18,12 @@ public final class NotesSettings {
     private static final String FILE_NAME = "settings.properties";
     private static final String RESTORE_OPEN_NOTES = "restoreOpenNotes";
     private static final String TRASH_RETENTION_HOURS = "trashRetentionHours";
+    private static final String DEFAULT_AREA = "defaultArea";
 
     private final Path settingsFile;
     private boolean restoreOpenNotes;
     private long trashRetentionHours;
+    private DefaultArea defaultArea;
 
     public NotesSettings(Path settingsDirectory) {
         settingsFile = settingsDirectory == null ? null : settingsDirectory.resolve(FILE_NAME);
@@ -47,9 +49,18 @@ public final class NotesSettings {
         this.trashRetentionHours = trashRetentionHours;
     }
 
+    public synchronized DefaultArea getDefaultArea() {
+        return defaultArea;
+    }
+
+    public synchronized void setDefaultArea(DefaultArea defaultArea) {
+        this.defaultArea = defaultArea == null ? DefaultArea.GLOBAL : defaultArea;
+    }
+
     public synchronized void restoreDefaults() {
         restoreOpenNotes = false;
         trashRetentionHours = DEFAULT_TRASH_RETENTION_HOURS;
+        defaultArea = DefaultArea.GLOBAL;
     }
 
     public synchronized void load() {
@@ -60,6 +71,7 @@ public final class NotesSettings {
             properties.load(input);
             restoreOpenNotes = Boolean.parseBoolean(properties.getProperty(RESTORE_OPEN_NOTES, "false"));
             trashRetentionHours = parseTrashRetentionHours(properties.getProperty(TRASH_RETENTION_HOURS));
+            defaultArea = parseDefaultArea(properties.getProperty(DEFAULT_AREA));
         } catch (IOException ignored) {
             restoreDefaults();
         }
@@ -70,6 +82,7 @@ public final class NotesSettings {
         Properties properties = new Properties();
         properties.setProperty(RESTORE_OPEN_NOTES, Boolean.toString(restoreOpenNotes));
         properties.setProperty(TRASH_RETENTION_HOURS, Long.toString(trashRetentionHours));
+        properties.setProperty(DEFAULT_AREA, defaultArea.name());
         Path temporary = null;
         try {
             Files.createDirectories(settingsFile.getParent());
@@ -104,5 +117,19 @@ public final class NotesSettings {
         } catch (NumberFormatException ignored) {
             return DEFAULT_TRASH_RETENTION_HOURS;
         }
+    }
+
+    private static DefaultArea parseDefaultArea(String value) {
+        if (value == null || value.isBlank()) return DefaultArea.GLOBAL;
+        try {
+            return DefaultArea.valueOf(value.strip().toUpperCase(java.util.Locale.ROOT));
+        } catch (IllegalArgumentException ignored) {
+            return DefaultArea.GLOBAL;
+        }
+    }
+
+    public enum DefaultArea {
+        GLOBAL,
+        PROJECT
     }
 }

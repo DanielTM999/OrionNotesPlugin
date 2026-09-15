@@ -1,8 +1,8 @@
 package dtm.ide.plugins.notes.store;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonParseException;
+import dtm.serialization.BinaryObjectSerializer;
+import dtm.serialization.exceptions.DecodeSerializationException;
+import dtm.serialization.mapper.BinaryObjectMapper;
 import dtm.ide.plugins.notes.model.NoteItem;
 import dtm.ide.plugins.notes.model.NoteType;
 import dtm.ide.plugins.notes.model.NotesIndex;
@@ -11,8 +11,6 @@ import dtm.ide.plugins.notes.model.NotesSessions;
 import dtm.ide.plugins.notes.model.TitleMode;
 
 import java.io.IOException;
-import java.io.Reader;
-import java.io.Writer;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
 import java.nio.charset.StandardCharsets;
@@ -45,7 +43,7 @@ import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 public final class NotesStore {
-    public static final int SCHEMA_VERSION = 1;
+    public static final int SCHEMA_VERSION = 2;
     public static final String UNTITLED = "Nota sem titulo";
 
     private static final DateTimeFormatter CONFLICT_TIME = DateTimeFormatter
@@ -59,7 +57,7 @@ public final class NotesStore {
     private final Path indexFile;
     private final Path sessionFile;
     private final Path lockFile;
-    private final Gson gson = new GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create();
+    private final BinaryObjectSerializer serializer = new BinaryObjectMapper();
     private final ReentrantLock jvmLock;
 
     private NotesIndex index;
@@ -68,8 +66,8 @@ public final class NotesStore {
         this.root = Objects.requireNonNull(root, "root").toAbsolutePath().normalize();
         this.contentDirectory = this.root.resolve("content");
         this.temporaryDirectory = this.root.resolve("tmp");
-        this.indexFile = this.root.resolve("index.json");
-        this.sessionFile = this.root.resolve("session.json");
+        this.indexFile = this.root.resolve("index.bin");
+        this.sessionFile = this.root.resolve("session.bin");
         this.lockFile = this.root.resolve("store.lock");
         this.jvmLock = JVM_LOCKS.computeIfAbsent(this.root, ignored -> new ReentrantLock());
         this.index = new NotesIndex();
@@ -94,6 +92,23 @@ public final class NotesStore {
         });
     }
 
+    public List<NoteItem> listVisible(String projectId) {
+        String normalizedProjectId = normalizeProjectId(projectId);
+        return withJvmLock(() -> {
+            refreshIndexForRead();
+            return index.getItems().stream()
+                    .filter(item -> !item.isDeleted())
+                    .filter(item -> isVisible(item, normalizedProjectId))
+                    .sorted(itemComparator())
+                    .map(NoteItem::copy)
+                    .toList();
+        });
+    }
+
+    public List<NoteItem> listTrash() {
+        return list(true);
+    }
+
     public Optional<NoteItem> find(String id) {
         if (id == null) return Optional.empty();
         return withJvmLock(() -> {
@@ -103,9 +118,13 @@ public final class NotesStore {
     }
 
     public NoteItem createNote(String parentId) throws IOException {
+        return createNote(parentId, null);
+    }
+
+    public NoteItem createNote(String parentId, String projectId) throws IOException {
         return mutate(() -> {
-            validateParent(parentId);
-            NoteItem item = newItem(NoteType.NOTE, parentId, UNTITLED);
+            String destinationProjectId = resolveDestinationProject(parentId, projectId);
+            NoteItem item = newItem(NoteType.NOTE, parentId, destinationProjectId, UNTITLED);
             index.getItems().add(item);
             writeContent(item.getId(), "");
             return item.copy();
@@ -113,9 +132,14 @@ public final class NotesStore {
     }
 
     public NoteItem createFolder(String parentId, String title) throws IOException {
+        return createFolder(parentId, null, title);
+    }
+
+    public NoteItem createFolder(String parentId, String projectId, String title) throws IOException {
         return mutate(() -> {
-            validateParent(parentId);
-            NoteItem item = newItem(NoteType.FOLDER, parentId, normalizeManualTitle(title, "Nova pasta"));
+            String destinationProjectId = resolveDestinationProject(parentId, projectId);
+            NoteItem item = newItem(NoteType.FOLDER, parentId, destinationProjectId,
+                    normalizeManualTitle(title, "Nova pasta"));
             item.setTitleMode(TitleMode.MANUAL);
             index.getItems().add(item);
             return item.copy();
@@ -134,25 +158,40 @@ public final class NotesStore {
     }
 
     public NoteItem move(String id, String parentId, int requestedOrder) throws IOException {
+        NoteItem item = find(id).orElseThrow(() -> new IllegalArgumentException("Item nao encontrado: " + id));
+        return move(id, parentId, item.getProjectId(), requestedOrder);
+    }
+
+    public NoteItem move(String id, String parentId, String projectId, int requestedOrder) throws IOException {
         return mutate(() -> {
             NoteItem item = requireActiveItem(id);
-            validateParent(parentId);
+            String destinationProjectId = resolveDestinationProject(parentId, projectId);
             if (item.isFolder() && parentId != null && isDescendant(parentId, id)) {
                 throw new IllegalArgumentException("Uma pasta nao pode ser movida para dentro dela mesma");
             }
             String oldParentId = item.getParentId();
+            String oldProjectId = item.getProjectId();
             item.setParentId(parentId);
             List<NoteItem> destination = index.getItems().stream()
                     .filter(candidate -> !candidate.isDeleted()
                             && !Objects.equals(candidate.getId(), id)
+                            && Objects.equals(destinationProjectId, candidate.getProjectId())
                             && Objects.equals(parentId, candidate.getParentId()))
                     .sorted(itemComparator()).collect(java.util.stream.Collectors.toCollection(ArrayList::new));
             int insertion = requestedOrder < 0 ? destination.size() : Math.min(requestedOrder, destination.size());
             destination.add(insertion, item);
             for (int i = 0; i < destination.size(); i++) destination.get(i).setOrder(i);
-            item.setUpdatedAt(Instant.now().toString());
-            item.setRevision(item.getRevision() + 1);
-            if (!Objects.equals(oldParentId, parentId)) normalizeSiblingOrder(oldParentId);
+            String now = Instant.now().toString();
+            boolean scopeChanged = !Objects.equals(oldProjectId, destinationProjectId);
+            List<NoteItem> movedItems = scopeChanged && item.isFolder() ? subtree(id) : List.of(item);
+            for (NoteItem moved : movedItems) {
+                moved.setProjectId(destinationProjectId);
+                moved.setUpdatedAt(now);
+                moved.setRevision(moved.getRevision() + 1);
+            }
+            if (!Objects.equals(oldParentId, parentId) || !Objects.equals(oldProjectId, destinationProjectId)) {
+                normalizeSiblingOrder(oldParentId, oldProjectId);
+            }
             return item.copy();
         });
     }
@@ -175,7 +214,10 @@ public final class NotesStore {
         mutate(() -> {
             NoteItem rootItem = requireItem(id);
             String destination = rootItem.getOriginalParentId();
-            if (destination != null && findInternal(destination).filter(item -> !item.isDeleted() && item.isFolder()).isEmpty()) {
+            if (destination != null && findInternal(destination)
+                    .filter(item -> !item.isDeleted() && item.isFolder())
+                    .filter(item -> Objects.equals(item.getProjectId(), rootItem.getProjectId()))
+                    .isEmpty()) {
                 destination = null;
             }
             rootItem.setParentId(destination);
@@ -259,7 +301,8 @@ public final class NotesStore {
             if (!current.isNote()) throw new IllegalArgumentException("O item nao e uma nota: " + id);
             String safeContent = content == null ? "" : content;
             if (current.getRevision() != expectedRevision) {
-                NoteItem conflict = newItem(NoteType.NOTE, current.getParentId(), conflictTitle(current.getTitle()));
+                NoteItem conflict = newItem(NoteType.NOTE, current.getParentId(), current.getProjectId(),
+                        conflictTitle(current.getTitle()));
                 conflict.setTitleMode(TitleMode.MANUAL);
                 index.getItems().add(conflict);
                 writeContent(conflict.getId(), safeContent);
@@ -300,6 +343,27 @@ public final class NotesStore {
         return List.copyOf(matches);
     }
 
+    public List<NoteItem> searchVisible(String query, String projectId) {
+        String term = normalizeSearch(query);
+        if (term.isBlank()) return listVisible(projectId);
+        List<NoteItem> matches = new ArrayList<>();
+        for (NoteItem item : listVisible(projectId)) {
+            if (!item.isNote()) continue;
+            String title = normalizeSearch(item.getTitle());
+            if (title.contains(term)) {
+                matches.add(item);
+                continue;
+            }
+            try {
+                String content = Files.exists(contentPath(item.getId()))
+                        ? Files.readString(contentPath(item.getId()), StandardCharsets.UTF_8) : "";
+                if (normalizeSearch(content).contains(term)) matches.add(item);
+            } catch (IOException ignored) {
+            }
+        }
+        return List.copyOf(matches);
+    }
+
     public NotesSessionState loadSession(String context) {
         return withJvmLock(() -> {
             NotesSessions sessions = readSessionsRecovering();
@@ -312,7 +376,7 @@ public final class NotesStore {
         withFileLock(() -> {
             NotesSessions sessions = readSessionsRecovering();
             sessions.getContexts().put(contextKey(context), state == null ? new NotesSessionState() : state.copy());
-            writeJsonAtomic(sessionFile, sessions);
+            writeBinaryAtomic(sessionFile, sessions);
             return null;
         });
     }
@@ -344,31 +408,36 @@ public final class NotesStore {
         return UNTITLED;
     }
 
-    private NoteItem newItem(NoteType type, String parentId, String title) {
+    private NoteItem newItem(NoteType type, String parentId, String projectId, String title) {
         String now = Instant.now().toString();
         NoteItem item = new NoteItem();
         item.setId(UUID.randomUUID().toString());
         item.setType(type);
+        item.setProjectId(normalizeProjectId(projectId));
         item.setParentId(parentId);
         item.setTitle(title);
         item.setTitleMode(type == NoteType.NOTE ? TitleMode.AUTO : TitleMode.MANUAL);
-        item.setOrder(nextOrder(parentId));
+        item.setOrder(nextOrder(parentId, item.getProjectId()));
         item.setCreatedAt(now);
         item.setUpdatedAt(now);
         item.setRevision(0);
         return item;
     }
 
-    private int nextOrder(String parentId) {
+    private int nextOrder(String parentId, String projectId) {
         return index.getItems().stream()
-                .filter(item -> !item.isDeleted() && Objects.equals(parentId, item.getParentId()))
+                .filter(item -> !item.isDeleted()
+                        && Objects.equals(projectId, item.getProjectId())
+                        && Objects.equals(parentId, item.getParentId()))
                 .mapToInt(NoteItem::getOrder)
                 .max().orElse(-1) + 1;
     }
 
-    private void normalizeSiblingOrder(String parentId) {
+    private void normalizeSiblingOrder(String parentId, String projectId) {
         List<NoteItem> siblings = index.getItems().stream()
-                .filter(item -> !item.isDeleted() && Objects.equals(parentId, item.getParentId()))
+                .filter(item -> !item.isDeleted()
+                        && Objects.equals(projectId, item.getProjectId())
+                        && Objects.equals(parentId, item.getParentId()))
                 .sorted(itemComparator()).toList();
         for (int i = 0; i < siblings.size(); i++) siblings.get(i).setOrder(i);
     }
@@ -405,10 +474,11 @@ public final class NotesStore {
         return false;
     }
 
-    private void validateParent(String parentId) {
-        if (parentId == null) return;
+    private String resolveDestinationProject(String parentId, String projectId) {
+        if (parentId == null) return normalizeProjectId(projectId);
         NoteItem parent = requireActiveItem(parentId);
         if (!parent.isFolder()) throw new IllegalArgumentException("O destino nao e uma pasta");
+        return parent.getProjectId();
     }
 
     private NoteItem requireItem(String id) {
@@ -444,7 +514,7 @@ public final class NotesStore {
 
     private void writeIndex() throws IOException {
         index.setSchemaVersion(SCHEMA_VERSION);
-        writeJsonAtomic(indexFile, index);
+        writeBinaryAtomic(indexFile, index);
     }
 
     private void writeContent(String id, String content) throws IOException {
@@ -458,36 +528,34 @@ public final class NotesStore {
     private NotesIndex loadIndexRecovering() throws IOException {
         if (!Files.exists(indexFile)) {
             NotesIndex fresh = new NotesIndex();
-            writeJsonAtomic(indexFile, fresh);
+            writeBinaryAtomic(indexFile, fresh);
             return fresh;
         }
         try {
             return readIndex(indexFile);
-        } catch (IOException | JsonParseException failure) {
+        } catch (IOException | DecodeSerializationException failure) {
             preserveCorrupt(indexFile);
             NotesIndex rebuilt = rebuildIndexFromContent();
-            writeJsonAtomic(indexFile, rebuilt);
+            writeBinaryAtomic(indexFile, rebuilt);
             return rebuilt;
         }
     }
 
     private NotesIndex readIndex(Path path) throws IOException {
-        try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
-            NotesIndex loaded = gson.fromJson(reader, NotesIndex.class);
-            if (loaded == null) throw new JsonParseException("Indice vazio");
-            if (loaded.getSchemaVersion() > SCHEMA_VERSION) {
-                throw new IOException("Versao de indice nao suportada: " + loaded.getSchemaVersion());
-            }
-            loaded.getItems();
-            return loaded;
+        NotesIndex loaded = serializer.readAsObject(Files.readAllBytes(path), NotesIndex.class);
+        if (loaded == null) throw new DecodeSerializationException("Indice vazio");
+        if (loaded.getSchemaVersion() > SCHEMA_VERSION) {
+            throw new IOException("Versao de indice nao suportada: " + loaded.getSchemaVersion());
         }
+        loaded.getItems();
+        return loaded;
     }
 
     private void refreshIndexForRead() {
         if (!Files.exists(indexFile)) return;
         try {
             index = readIndex(indexFile);
-        } catch (IOException | JsonParseException ignored) {
+        } catch (IOException | DecodeSerializationException ignored) {
         }
     }
 
@@ -505,7 +573,7 @@ public final class NotesStore {
                         Files.move(path, contentPath(id), StandardCopyOption.REPLACE_EXISTING);
                     }
                     String content = Files.readString(path, StandardCharsets.UTF_8);
-                    NoteItem item = newItem(NoteType.NOTE, null, deriveTitle(content));
+                    NoteItem item = newItem(NoteType.NOTE, null, null, deriveTitle(content));
                     item.setId(id);
                     rebuilt.getItems().add(item);
                 } catch (IOException ignored) {
@@ -517,12 +585,12 @@ public final class NotesStore {
 
     private NotesSessions readSessionsRecovering() {
         if (!Files.exists(sessionFile)) return new NotesSessions();
-        try (Reader reader = Files.newBufferedReader(sessionFile, StandardCharsets.UTF_8)) {
-            NotesSessions sessions = gson.fromJson(reader, NotesSessions.class);
+        try {
+            NotesSessions sessions = serializer.readAsObject(Files.readAllBytes(sessionFile), NotesSessions.class);
             if (sessions == null || sessions.getSchemaVersion() > SCHEMA_VERSION) return new NotesSessions();
             sessions.getContexts();
             return sessions;
-        } catch (IOException | JsonParseException failure) {
+        } catch (IOException | DecodeSerializationException failure) {
             try { preserveCorrupt(sessionFile); } catch (IOException ignored) { }
             return new NotesSessions();
         }
@@ -540,12 +608,10 @@ public final class NotesStore {
         }
     }
 
-    private void writeJsonAtomic(Path target, Object value) throws IOException {
+    private void writeBinaryAtomic(Path target, Object value) throws IOException {
         Path temporary = temporaryDirectory.resolve(target.getFileName() + "." + UUID.randomUUID() + ".tmp");
-        try (Writer writer = Files.newBufferedWriter(temporary, StandardCharsets.UTF_8,
-                StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
-            gson.toJson(value, writer);
-        }
+        Files.write(temporary, serializer.encodeToByteArray(value),
+                StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
         moveAtomic(temporary, target);
     }
 
@@ -602,6 +668,14 @@ public final class NotesStore {
 
     private static String normalizeSearch(String text) {
         return text == null ? "" : text.toLowerCase(Locale.ROOT).strip();
+    }
+
+    private static String normalizeProjectId(String projectId) {
+        return projectId == null || projectId.isBlank() ? null : projectId.strip();
+    }
+
+    private static boolean isVisible(NoteItem item, String projectId) {
+        return item.getProjectId() == null || Objects.equals(item.getProjectId(), projectId);
     }
 
     private static String contextKey(String context) {

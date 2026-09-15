@@ -21,6 +21,7 @@ class NotesSettingsTest {
 
         assertFalse(settings.isRestoreOpenNotes());
         assertEquals(24, settings.getTrashRetentionHours());
+        assertEquals(NotesSettings.DefaultArea.GLOBAL, settings.getDefaultArea());
     }
 
     @Test
@@ -37,10 +38,12 @@ class NotesSettingsTest {
         NotesSettings settings = new NotesSettings(temporaryDirectory);
         settings.setRestoreOpenNotes(true);
         settings.setTrashRetentionHours(1);
+        settings.setDefaultArea(NotesSettings.DefaultArea.PROJECT);
         settings.restoreDefaults();
 
         assertFalse(settings.isRestoreOpenNotes());
         assertEquals(24, settings.getTrashRetentionHours());
+        assertEquals(NotesSettings.DefaultArea.GLOBAL, settings.getDefaultArea());
     }
 
     @Test
@@ -63,5 +66,15 @@ class NotesSettingsTest {
         NotesSettings settings = new NotesSettings(temporaryDirectory);
 
         assertThrows(IllegalArgumentException.class, () -> settings.setTrashRetentionHours(-1));
+    }
+
+    @Test
+    void persistsTheDefaultCreationArea() {
+        NotesSettings settings = new NotesSettings(temporaryDirectory);
+        settings.setDefaultArea(NotesSettings.DefaultArea.PROJECT);
+        settings.save();
+
+        assertEquals(NotesSettings.DefaultArea.PROJECT,
+                new NotesSettings(temporaryDirectory).getDefaultArea());
     }
 }

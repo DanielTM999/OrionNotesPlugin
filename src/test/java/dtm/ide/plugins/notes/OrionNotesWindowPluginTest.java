@@ -1,8 +1,10 @@
 package dtm.ide.plugins.notes;
 
 import dtm.ide.plugins.notes.store.NotesStore;
+import dtm.ide.plugins.notes.model.NoteItem;
 import org.junit.jupiter.api.Test;
 
+import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
 
@@ -42,5 +44,24 @@ class OrionNotesWindowPluginTest {
         assertFalse(OrionNotesWindowPlugin.hasNewNoteArgument(List.of("--help")));
         assertFalse(OrionNotesWindowPlugin.hasNewNoteArgument(Arrays.asList(null, "")));
         assertFalse(OrionNotesWindowPlugin.hasNewNoteArgument(null));
+    }
+
+    @Test
+    void derivesProjectIdentityAndLabelFromTheNormalizedPath() {
+        Path project = Path.of("projects", "sample", "..", "notes-project");
+
+        assertEquals(project.toAbsolutePath().normalize().toString(), OrionNotesWindowPlugin.projectId(project));
+        assertEquals("notes-project", OrionNotesWindowPlugin.projectLabel(project));
+    }
+
+    @Test
+    void globalNotesAreAlwaysVisibleButProjectNotesAreContextual() {
+        NoteItem global = new NoteItem();
+        NoteItem project = new NoteItem();
+        project.setProjectId("project-a");
+
+        assertTrue(OrionNotesWindowPlugin.isVisibleInProject(global, "project-b"));
+        assertTrue(OrionNotesWindowPlugin.isVisibleInProject(project, "project-a"));
+        assertFalse(OrionNotesWindowPlugin.isVisibleInProject(project, "project-b"));
     }
 }

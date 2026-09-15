@@ -47,7 +47,7 @@ import java.util.concurrent.TimeUnit;
 @PluginReference(
         id = "orion-notes.window",
         name = "Orion Notes",
-        description = "Notas globais com pastas, busca, lixeira e autosave",
+        description = "Notas globais e por projeto com pastas, busca, lixeira e autosave",
         version = "1.0.0"
 )
 public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPanel.Actions {
@@ -67,6 +67,8 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
     private volatile NotesPanel panel;
     private volatile String panelKey;
     private volatile String sessionContext = "no-project";
+    private volatile String currentProjectId;
+    private volatile String currentProjectLabel;
     private volatile String activeNoteId;
     private volatile Set<String> expandedFolderIds = Set.of();
     private volatile String selectedItemId;
@@ -84,7 +86,15 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
             Path notesRoot = resource.getSharedResourcePath().resolve("orion-notes");
             store = new NotesStore(notesRoot);
             settings = new NotesSettings(notesRoot);
-            sessionContext = currentSessionContext();
+            Path openedProject;
+            try {
+                openedProject = getCurrentOpenedProject().orElse(null);
+            } catch (RuntimeException unavailableProject) {
+                openedProject = null;
+            }
+            currentProjectId = projectId(openedProject);
+            currentProjectLabel = projectLabel(openedProject);
+            sessionContext = sessionContext(currentProjectId);
             panel = createPanelOnEdt();
             panelKey = registerToolPanel(
                     DockRegion.RIGHT,
@@ -96,7 +106,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
             restoreSession();
             trashCleanupFuture = ioExecutor.scheduleWithFixedDelay(
                     this::purgeExpiredTrash, 0, 1, TimeUnit.MINUTES);
-            if (hasNewNoteArgument(getApplicationArgs())) createNote(null);
+            if (hasNewNoteArgument(getApplicationArgs())) createNote(null, defaultProjectId());
         } catch (Exception failure) {
             notifyFailure("Nao foi possivel iniciar o bloco de notas", failure);
         }
@@ -123,8 +133,29 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
 
     @Override
     public void onProjectOpen(Path projectPath) {
-        sessionContext = projectPath == null ? "no-project" : projectPath.toAbsolutePath().normalize().toString();
-        restoreSession();
+        String nextProjectId = projectId(projectPath);
+        String nextProjectLabel = projectLabel(projectPath);
+        String previousProjectId = currentProjectId;
+        String previousSessionContext = sessionContext;
+        if (java.util.Objects.equals(previousProjectId, nextProjectId)) {
+            currentProjectLabel = nextProjectLabel;
+            NotesPanel currentPanel = panel;
+            if (currentPanel != null) SwingUtilities.invokeLater(
+                    () -> currentPanel.setCurrentProject(nextProjectId, nextProjectLabel));
+            return;
+        }
+        ioExecutor.execute(() -> {
+            saveSessionNow(previousSessionContext);
+            currentProjectId = nextProjectId;
+            currentProjectLabel = nextProjectLabel;
+            sessionContext = sessionContext(nextProjectId);
+            SwingUtilities.invokeLater(() -> {
+                closeEditorsOutsideProject(nextProjectId);
+                NotesPanel currentPanel = panel;
+                if (currentPanel != null) currentPanel.setCurrentProject(nextProjectId, nextProjectLabel);
+                restoreSession();
+            });
+        });
     }
 
     @Override
@@ -152,12 +183,12 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
     }
 
     @Override
-    public void createNote(String parentId) {
+    public void createNote(String parentId, String projectId) {
         NotesStore current = store;
         if (current == null) return;
         ioExecutor.execute(() -> {
             try {
-                NoteItem note = current.createNote(parentId);
+                NoteItem note = current.createNote(parentId, projectId);
                 SwingUtilities.invokeLater(() -> {
                     refreshPanel();
                     openNote(note.getId());
@@ -168,12 +199,12 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         });
     }
 
-    private void createFolder(String parentId, String title) {
+    private void createFolder(String parentId, String projectId, String title) {
         NotesStore current = store;
         if (current == null) return;
         ioExecutor.execute(() -> {
             try {
-                current.createFolder(parentId, title);
+                current.createFolder(parentId, projectId, title);
                 SwingUtilities.invokeLater(this::refreshPanel);
             } catch (Exception failure) {
                 notifyFailure("Nao foi possivel criar a pasta", failure);
@@ -193,7 +224,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         ioExecutor.execute(() -> {
             try {
                 NotesStore.LoadedNote loaded = current.loadNote(id);
-                if (loaded.item().isDeleted()) return;
+                if (loaded.item().isDeleted() || !isVisibleInProject(loaded.item(), currentProjectId)) return;
                 SwingUtilities.invokeLater(() -> openLoadedNote(loaded));
             } catch (Exception failure) {
                 notifyFailure("Nao foi possivel abrir a nota", failure);
@@ -202,9 +233,9 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
     }
 
     @Override
-    public void requestCreateFolder(String parentId) {
+    public void requestCreateFolder(String parentId, String projectId) {
         if (!SwingUtilities.isEventDispatchThread()) {
-            SwingUtilities.invokeLater(() -> requestCreateFolder(parentId));
+            SwingUtilities.invokeLater(() -> requestCreateFolder(parentId, projectId));
             return;
         }
         JTextField input = new JTextField();
@@ -217,7 +248,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
                 .onValidate(context -> validateName(context.value()))
                 .show();
         if (title != null && !title.isBlank()) {
-            createFolder(parentId, title.strip());
+            createFolder(parentId, projectId, title.strip());
         }
     }
 
@@ -262,11 +293,11 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
     }
 
     @Override
-    public boolean move(String id, String parentId, int order) {
+    public boolean move(String id, String parentId, String projectId, int order) {
         NotesStore current = store;
         if (current == null) return false;
         try {
-            NoteItem moved = current.move(id, parentId, order);
+            NoteItem moved = current.move(id, parentId, projectId, order);
             applyMetadataUpdate(moved);
             return true;
         } catch (Exception failure) {
@@ -349,7 +380,8 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
                 .type(ModernDialog.Type.QUESTION)
                 .accentColor(danger)
                 .title(text("menu.emptyTrash", "Empty trash"))
-                .message(text("dialog.emptyTrash.message", "Permanently delete every item in the trash?"))
+                .message(text("dialog.emptyTrash.message",
+                        "Permanently delete every item in the trash, including other projects?"))
                 .option(text("menu.emptyTrash", "Empty trash"), 0, danger, UiTokens.onColor(danger))
                 .option(text("button.cancel", "Cancel"), 1)
                 .show();
@@ -522,6 +554,21 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         }
     }
 
+    private void closeEditorsOutsideProject(String projectId) {
+        for (EditorSession editor : List.copyOf(editors.values())) {
+            String editorProjectId = editor.item.getProjectId();
+            if (editorProjectId != null && !java.util.Objects.equals(editorProjectId, projectId)
+                    && editor.handle != null) {
+                editor.handle.close();
+            }
+        }
+    }
+
+    static boolean isVisibleInProject(NoteItem item, String projectId) {
+        return item != null && (item.getProjectId() == null
+                || java.util.Objects.equals(item.getProjectId(), projectId));
+    }
+
     private void applyMetadataUpdate(NoteItem item) {
         EditorSession editor = editors.get(item.getId());
         if (editor != null) {
@@ -592,11 +639,15 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         if (shuttingDown || store == null) return;
         synchronized (sessionLock) {
             if (sessionSaveFuture != null) sessionSaveFuture.cancel(false);
-            sessionSaveFuture = ioExecutor.schedule(this::saveSessionNow, 300, TimeUnit.MILLISECONDS);
+            sessionSaveFuture = ioExecutor.schedule(() -> saveSessionNow(), 300, TimeUnit.MILLISECONDS);
         }
     }
 
     private void saveSessionNow() {
+        saveSessionNow(sessionContext);
+    }
+
+    private void saveSessionNow(String context) {
         NotesStore current = store;
         if (current == null) return;
         NotesSessionState state = new NotesSessionState();
@@ -607,7 +658,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         state.setExpandedFolderIds(new LinkedHashSet<>(expandedFolderIds));
         state.setSelectedItemId(selectedItemId);
         try {
-            current.saveSession(sessionContext, state);
+            current.saveSession(context, state);
         } catch (IOException failure) {
             if (!shuttingDown) notifyFailure("Nao foi possivel salvar a sessao das notas", failure);
         }
@@ -628,7 +679,8 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
     private void createNewNoteFromUi() {
         openPanel();
         NotesPanel current = panel;
-        createNote(current == null ? null : current.selectedFolderId());
+        if (current != null) current.createNote();
+        else createNote(null, defaultProjectId());
     }
 
     private void createNewFolderFromUi() {
@@ -638,12 +690,14 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
     }
 
     private NotesPanel createPanelOnEdt() throws Exception {
-        if (SwingUtilities.isEventDispatchThread()) return new NotesPanel(store, this, this::text);
+        if (SwingUtilities.isEventDispatchThread()) {
+            return new NotesPanel(store, this, this::text, currentProjectId, currentProjectLabel);
+        }
         java.util.concurrent.atomic.AtomicReference<NotesPanel> created = new java.util.concurrent.atomic.AtomicReference<>();
         java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
         SwingUtilities.invokeAndWait(() -> {
             try {
-                created.set(new NotesPanel(store, this, this::text));
+                created.set(new NotesPanel(store, this, this::text, currentProjectId, currentProjectLabel));
             } catch (Throwable error) {
                 failure.set(error);
             }
@@ -657,14 +711,25 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         return getText(key, fallback);
     }
 
-    private String currentSessionContext() {
-        try {
-            return getCurrentOpenedProject()
-                    .map(path -> path.toAbsolutePath().normalize().toString())
-                    .orElse("no-project");
-        } catch (RuntimeException failure) {
-            return "no-project";
-        }
+    @Override
+    public String defaultProjectId() {
+        return ensureSettings().getDefaultArea() == NotesSettings.DefaultArea.PROJECT
+                ? currentProjectId : null;
+    }
+
+    static String projectId(Path projectPath) {
+        return projectPath == null ? null : projectPath.toAbsolutePath().normalize().toString();
+    }
+
+    static String projectLabel(Path projectPath) {
+        if (projectPath == null) return null;
+        Path normalized = projectPath.toAbsolutePath().normalize();
+        Path fileName = normalized.getFileName();
+        return fileName == null ? normalized.toString() : fileName.toString();
+    }
+
+    private static String sessionContext(String projectId) {
+        return projectId == null || projectId.isBlank() ? "no-project" : projectId;
     }
 
     private void notifyFailure(String message, Throwable failure) {
