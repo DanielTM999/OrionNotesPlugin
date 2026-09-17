@@ -173,6 +173,27 @@ class NotesStoreTest {
     }
 
     @Test
+    void emptyTrashByProjectRemovesOnlyThatProjectItems() throws Exception {
+        NotesStore store = new NotesStore(temporaryDirectory);
+        NoteItem global = store.createNote(null, null);
+        NoteItem projectA = store.createNote(null, "C:\\projects\\a");
+        NoteItem projectB = store.createNote(null, "C:\\projects\\b");
+        store.moveToTrash(global.getId());
+        store.moveToTrash(projectA.getId());
+        store.moveToTrash(projectB.getId());
+
+        store.emptyTrash("C:\\projects\\a");
+
+        assertEquals(Set.of(global.getId(), projectB.getId()), store.listTrash().stream()
+                .map(NoteItem::getId).collect(java.util.stream.Collectors.toSet()));
+
+        store.emptyTrash(null);
+
+        assertEquals(Set.of(projectB.getId()), store.listTrash().stream()
+                .map(NoteItem::getId).collect(java.util.stream.Collectors.toSet()));
+    }
+
+    @Test
     void upgradesSchemaOneItemsAsGlobalOnTheNextWrite() throws Exception {
         NotesStore store = new NotesStore(temporaryDirectory);
         NoteItem legacy = store.createNote(null);

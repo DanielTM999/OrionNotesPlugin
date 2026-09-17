@@ -401,6 +401,38 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         });
     }
 
+    @Override
+    public void requestEmptyTrashArea(String projectId, String label) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(() -> requestEmptyTrashArea(projectId, label));
+            return;
+        }
+        java.awt.Color danger = UiTokens.danger();
+        int option = createModernDialogBuilder()
+                .type(ModernDialog.Type.QUESTION)
+                .accentColor(danger)
+                .title(text("menu.emptyTrashArea", "Empty trash for this project"))
+                .message(text("dialog.emptyTrashArea.message",
+                        "Permanently delete every trashed item of") + " '" + label + "'?")
+                .option(text("menu.emptyTrash", "Empty trash"), 0, danger, UiTokens.onColor(danger))
+                .option(text("button.cancel", "Cancel"), 1)
+                .show();
+        if (option == 0) emptyTrashArea(projectId);
+    }
+
+    private void emptyTrashArea(String projectId) {
+        NotesStore current = store;
+        if (current == null) return;
+        ioExecutor.execute(() -> {
+            try {
+                current.emptyTrash(projectId);
+                SwingUtilities.invokeLater(this::refreshPanel);
+            } catch (Exception failure) {
+                notifyFailure("Nao foi possivel esvaziar a lixeira do projeto", failure);
+            }
+        });
+    }
+
     private void onSettingsChanged() {
         if (!shuttingDown) ioExecutor.execute(this::purgeExpiredTrash);
     }

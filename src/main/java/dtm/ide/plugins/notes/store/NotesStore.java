@@ -257,6 +257,23 @@ public final class NotesStore {
         });
     }
 
+    public void emptyTrash(String projectId) throws IOException {
+        String normalizedProjectId = normalizeProjectId(projectId);
+        mutate(() -> {
+            List<NoteItem> removed = index.getItems().stream()
+                    .filter(NoteItem::isDeleted)
+                    .filter(item -> Objects.equals(normalizedProjectId, item.getProjectId()))
+                    .toList();
+            for (NoteItem item : removed) {
+                if (item.isNote()) Files.deleteIfExists(contentPath(item.getId()));
+            }
+            Set<String> removedIds = removed.stream().map(NoteItem::getId)
+                    .collect(java.util.stream.Collectors.toSet());
+            index.getItems().removeIf(item -> removedIds.contains(item.getId()));
+            return null;
+        });
+    }
+
     public int purgeExpiredTrash(Duration retention, Instant now) throws IOException {
         Objects.requireNonNull(retention, "retention");
         Objects.requireNonNull(now, "now");

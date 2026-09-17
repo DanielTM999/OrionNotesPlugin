@@ -155,6 +155,7 @@ public final class NotesPanel extends JPanel {
         tree.setDragAndDropEnabled(true);
         tree.setDropPolicy(this::handleDrop);
         tree.setPopupMenuProvider(context -> popupFor(context.node()));
+        tree.setDeleteHandler(this::handleDelete);
         tree.addTreeSelectionListener(event -> actions.onTreeStateChanged(
                 expandedFolderIds(), selectedItemId()));
         tree.addMouseListener(new MouseAdapter() {
@@ -370,6 +371,39 @@ public final class NotesPanel extends JPanel {
         return node;
     }
 
+    private void handleDelete(List<TreeNode<Entry>> selection) {
+        TreeNode<Entry> focused = tree.getSelectedNode();
+        if (focused == null && selection != null && !selection.isEmpty()) focused = selection.get(0);
+        if (focused == null || focused.getData() == null) return;
+        Entry entry = focused.getData();
+        switch (entry.kind()) {
+            case TRASH -> actions.requestEmptyTrash();
+            case TRASH_AREA -> actions.requestEmptyTrashArea(entry.projectId(), entry.label());
+            case ITEM -> {
+                if (entry.item().isDeleted()) {
+                    actions.requestDeletePermanently(entry.item().getId(), entry.item().getTitle());
+                    return;
+                }
+                for (String id : activeItemIds(selection, focused)) actions.moveToTrash(id);
+            }
+            default -> {
+            }
+        }
+    }
+
+    private Set<String> activeItemIds(List<TreeNode<Entry>> selection, TreeNode<Entry> fallback) {
+        Set<String> ids = new LinkedHashSet<>();
+        if (selection != null) {
+            for (TreeNode<Entry> node : selection) {
+                Entry entry = node == null ? null : node.getData();
+                if (entry == null || entry.kind() != EntryKind.ITEM || entry.item().isDeleted()) continue;
+                ids.add(entry.item().getId());
+            }
+        }
+        if (ids.isEmpty()) ids.add(fallback.getData().item().getId());
+        return ids;
+    }
+
     private boolean handleDrop(TreeDropContext<Entry> context) {
         if (context == null || context.draggedNodes().isEmpty()) return false;
         TreeNode<Entry> target = context.targetNode();
@@ -415,7 +449,11 @@ public final class NotesPanel extends JPanel {
             add(menu, text("menu.emptyTrash", "Empty trash"), event -> actions.requestEmptyTrash());
             return menu;
         }
-        if (entry.kind() == EntryKind.TRASH_AREA) return menu;
+        if (entry.kind() == EntryKind.TRASH_AREA) {
+            add(menu, text("menu.emptyTrashArea", "Empty trash for this project"),
+                    event -> actions.requestEmptyTrashArea(entry.projectId(), entry.label()));
+            return menu;
+        }
         NoteItem item = entry.item();
         if (item.isDeleted()) {
             add(menu, text("menu.restore", "Restore"), event -> actions.restore(item.getId()));
@@ -455,6 +493,7 @@ public final class NotesPanel extends JPanel {
         void restore(String id);
         void requestDeletePermanently(String id, String title);
         void requestEmptyTrash();
+        void requestEmptyTrashArea(String projectId, String label);
         void onTreeStateChanged(Set<String> expandedIds, String selectedItemId);
         String defaultProjectId();
     }

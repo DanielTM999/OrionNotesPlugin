@@ -52,6 +52,7 @@ class NotesPanelTest {
         @Override public void restore(String id) { }
         @Override public void requestDeletePermanently(String id, String title) { }
         @Override public void requestEmptyTrash() { }
+        @Override public void requestEmptyTrashArea(String projectId, String label) { }
         @Override public void onTreeStateChanged(Set<String> expandedIds, String selectedItemId) { }
         @Override public String defaultProjectId() { return defaultProjectId; }
     }
