@@ -37,8 +37,10 @@ public final class NoteItem {
     }
 
     public boolean isDeleted() { return deletedAt != null && !deletedAt.isBlank(); }
-    public boolean isNote() { return type == NoteType.NOTE; }
+    public boolean isNote() { return type != null && type != NoteType.FOLDER; }
     public boolean isFolder() { return type == NoteType.FOLDER; }
+    public boolean isTextNote() { return type == NoteType.NOTE; }
+    public boolean isDocument() { return type != null && type.isDocument(); }
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }

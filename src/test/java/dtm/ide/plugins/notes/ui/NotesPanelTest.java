@@ -1,5 +1,6 @@
 package dtm.ide.plugins.notes.ui;
 
+import dtm.ide.plugins.notes.model.NoteType;
 import dtm.ide.plugins.notes.store.NotesStore;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -44,6 +45,9 @@ class NotesPanelTest {
             created.set(new NotesPanel.CreationTarget(parentId, projectId));
         }
 
+        @Override public void requestCreateDocument(String parentId, String projectId, NoteType type) { }
+        @Override public void requestImport(String parentId, String projectId) { }
+        @Override public void requestExport(String id) { }
         @Override public void requestCreateFolder(String parentId, String projectId) { }
         @Override public void openNote(String id) { }
         @Override public void requestRename(String id, String currentTitle) { }

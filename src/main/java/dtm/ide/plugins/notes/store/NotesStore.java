@@ -19,6 +19,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -43,8 +44,11 @@ import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 public final class NotesStore {
-    public static final int SCHEMA_VERSION = 2;
+    public static final int SCHEMA_VERSION = 3;
     public static final String UNTITLED = "Nota sem titulo";
+    public static final String UNTITLED_WORD = "Documento sem titulo";
+    public static final String UNTITLED_SHEET = "Planilha sem titulo";
+    private static final List<NoteType> CONTENT_TYPES = List.of(NoteType.NOTE, NoteType.WORD, NoteType.SHEET);
 
     private static final DateTimeFormatter CONFLICT_TIME = DateTimeFormatter
             .ofPattern("yyyy-MM-dd HH-mm")
@@ -59,6 +63,7 @@ public final class NotesStore {
     private final Path lockFile;
     private final BinaryObjectSerializer serializer = new BinaryObjectMapper();
     private final ReentrantLock jvmLock;
+    private final Map<String, SearchText> searchCache = new ConcurrentHashMap<>();
 
     private NotesIndex index;
 
@@ -131,6 +136,21 @@ public final class NotesStore {
         });
     }
 
+    /** Cria uma nota Word ou Planilha com titulo manual; o conteudo ja deve estar codificado como DOCX/XLSX. */
+    public NoteItem createDocument(String parentId, String projectId, NoteType type, String title, byte[] content)
+            throws IOException {
+        Objects.requireNonNull(type, "type");
+        if (!type.isDocument()) throw new IllegalArgumentException("Tipo de documento invalido: " + type);
+        byte[] safeContent = content == null ? new byte[0] : content.clone();
+        return mutate(() -> {
+            String destinationProjectId = resolveDestinationProject(parentId, projectId);
+            NoteItem item = newItem(type, parentId, destinationProjectId, normalizeManualTitle(title, defaultTitle(type)));
+            writeBytes(contentPath(item), safeContent);
+            index.getItems().add(item);
+            return item.copy();
+        });
+    }
+
     public NoteItem createFolder(String parentId, String title) throws IOException {
         return createFolder(parentId, null, title);
     }
@@ -149,7 +169,7 @@ public final class NotesStore {
     public NoteItem rename(String id, String title) throws IOException {
         return mutate(() -> {
             NoteItem item = requireItem(id);
-            item.setTitle(normalizeManualTitle(title, item.isFolder() ? "Nova pasta" : UNTITLED));
+            item.setTitle(normalizeManualTitle(title, defaultTitle(item.getType())));
             item.setTitleMode(TitleMode.MANUAL);
             item.setUpdatedAt(Instant.now().toString());
             item.setRevision(item.getRevision() + 1);
@@ -238,7 +258,7 @@ public final class NotesStore {
                 throw new IllegalStateException("Somente itens da lixeira podem ser excluidos definitivamente");
             }
             for (NoteItem item : removed) {
-                if (item.isNote()) Files.deleteIfExists(contentPath(item.getId()));
+                deleteContent(item);
             }
             Set<String> removedIds = removed.stream().map(NoteItem::getId).collect(java.util.stream.Collectors.toSet());
             index.getItems().removeIf(item -> removedIds.contains(item.getId()));
@@ -250,7 +270,7 @@ public final class NotesStore {
         mutate(() -> {
             List<NoteItem> removed = index.getItems().stream().filter(NoteItem::isDeleted).toList();
             for (NoteItem item : removed) {
-                if (item.isNote()) Files.deleteIfExists(contentPath(item.getId()));
+                deleteContent(item);
             }
             index.getItems().removeIf(NoteItem::isDeleted);
             return null;
@@ -265,7 +285,7 @@ public final class NotesStore {
                     .filter(item -> Objects.equals(normalizedProjectId, item.getProjectId()))
                     .toList();
             for (NoteItem item : removed) {
-                if (item.isNote()) Files.deleteIfExists(contentPath(item.getId()));
+                deleteContent(item);
             }
             Set<String> removedIds = removed.stream().map(NoteItem::getId)
                     .collect(java.util.stream.Collectors.toSet());
@@ -289,7 +309,7 @@ public final class NotesStore {
                     .toList();
             if (removed.isEmpty()) return 0;
             for (NoteItem item : removed) {
-                if (item.isNote()) Files.deleteIfExists(contentPath(item.getId()));
+                deleteContent(item);
             }
             Set<String> removedIds = removed.stream().map(NoteItem::getId)
                     .collect(java.util.stream.Collectors.toSet());
@@ -305,31 +325,43 @@ public final class NotesStore {
             NoteItem item = findInternal(id).map(NoteItem::copy)
                     .orElseThrow(() -> new IllegalArgumentException("Nota nao encontrada: " + id));
             if (!item.isNote()) throw new IllegalArgumentException("O item nao e uma nota: " + id);
-            String content = Files.exists(contentPath(id))
-                    ? Files.readString(contentPath(id), StandardCharsets.UTF_8) : "";
-            return new LoadedNote(item, content);
+            Path path = contentPath(item);
+            byte[] data = Files.exists(path) ? Files.readAllBytes(path) : new byte[0];
+            return new LoadedNote(item, data);
         });
     }
 
     public SaveResult saveContent(String id, String content, long expectedRevision) throws IOException {
+        String safeContent = content == null ? "" : content;
+        return save(id, false, safeContent.getBytes(StandardCharsets.UTF_8), expectedRevision, safeContent);
+    }
+
+    /** Grava atomicamente o DOCX/XLSX de uma nota; uma revisao divergente preserva o conteudo numa copia. */
+    public SaveResult saveDocument(String id, byte[] content, long expectedRevision) throws IOException {
+        return save(id, true, content == null ? new byte[0] : content.clone(), expectedRevision, null);
+    }
+
+    private SaveResult save(String id, boolean document, byte[] content, long expectedRevision, String text)
+            throws IOException {
         return withFileLock(() -> {
             index = readIndex(indexFile);
             NoteItem current = requireActiveItem(id);
-            if (!current.isNote()) throw new IllegalArgumentException("O item nao e uma nota: " + id);
-            String safeContent = content == null ? "" : content;
+            if (!current.isNote() || current.isDocument() != document) {
+                throw new IllegalArgumentException("Tipo de nota inesperado para " + id + ": " + current.getType());
+            }
             if (current.getRevision() != expectedRevision) {
-                NoteItem conflict = newItem(NoteType.NOTE, current.getParentId(), current.getProjectId(),
-                        conflictTitle(current.getTitle()));
+                NoteItem conflict = newItem(current.getType(), current.getParentId(), current.getProjectId(),
+                        conflictTitle(current.getTitle(), current.getType()));
                 conflict.setTitleMode(TitleMode.MANUAL);
+                writeBytes(contentPath(conflict), content);
                 index.getItems().add(conflict);
-                writeContent(conflict.getId(), safeContent);
                 writeIndex();
                 return SaveResult.conflict(current.copy(), conflict.copy());
             }
 
-            writeContent(current.getId(), safeContent);
-            if (current.getTitleMode() == TitleMode.AUTO) {
-                current.setTitle(deriveTitle(safeContent));
+            writeBytes(contentPath(current), content);
+            if (text != null && current.getTitleMode() == TitleMode.AUTO) {
+                current.setTitle(deriveTitle(text));
             }
             current.setRevision(current.getRevision() + 1);
             current.setUpdatedAt(Instant.now().toString());
@@ -341,44 +373,42 @@ public final class NotesStore {
     public List<NoteItem> search(String query, boolean includeDeleted) {
         String term = normalizeSearch(query);
         if (term.isBlank()) return list(includeDeleted);
-        List<NoteItem> candidates = list(includeDeleted);
-        List<NoteItem> matches = new ArrayList<>();
-        for (NoteItem item : candidates) {
-            if (!item.isNote()) continue;
-            String title = normalizeSearch(item.getTitle());
-            if (title.contains(term)) {
-                matches.add(item);
-                continue;
-            }
-            try {
-                String content = Files.exists(contentPath(item.getId()))
-                        ? Files.readString(contentPath(item.getId()), StandardCharsets.UTF_8) : "";
-                if (normalizeSearch(content).contains(term)) matches.add(item);
-            } catch (IOException ignored) {
-            }
-        }
-        return List.copyOf(matches);
+        return matching(list(includeDeleted), term);
     }
 
     public List<NoteItem> searchVisible(String query, String projectId) {
         String term = normalizeSearch(query);
         if (term.isBlank()) return listVisible(projectId);
+        return matching(listVisible(projectId), term);
+    }
+
+    private List<NoteItem> matching(List<NoteItem> candidates, String term) {
         List<NoteItem> matches = new ArrayList<>();
-        for (NoteItem item : listVisible(projectId)) {
+        for (NoteItem item : candidates) {
             if (!item.isNote()) continue;
-            String title = normalizeSearch(item.getTitle());
-            if (title.contains(term)) {
+            if (normalizeSearch(item.getTitle()).contains(term)
+                    || normalizeSearch(searchableText(item)).contains(term)) {
                 matches.add(item);
-                continue;
-            }
-            try {
-                String content = Files.exists(contentPath(item.getId()))
-                        ? Files.readString(contentPath(item.getId()), StandardCharsets.UTF_8) : "";
-                if (normalizeSearch(content).contains(term)) matches.add(item);
-            } catch (IOException ignored) {
             }
         }
         return List.copyOf(matches);
+    }
+
+    private String searchableText(NoteItem item) {
+        Path path = contentPath(item);
+        try {
+            if (!Files.exists(path)) return "";
+            if (item.isTextNote()) return Files.readString(path, StandardCharsets.UTF_8);
+            FileTime modified = Files.getLastModifiedTime(path);
+            long size = Files.size(path);
+            SearchText cached = searchCache.get(item.getId());
+            if (cached != null && cached.matches(item.getRevision(), modified, size)) return cached.text();
+            String text = NoteDocuments.searchableText(item.getType(), Files.readAllBytes(path));
+            searchCache.put(item.getId(), new SearchText(item.getRevision(), modified, size, text));
+            return text;
+        } catch (IOException | RuntimeException unreadable) {
+            return "";
+        }
     }
 
     public NotesSessionState loadSession(String context) {
@@ -410,6 +440,13 @@ public final class NotesStore {
             parentId = parent.get().getParentId();
         }
         return String.join(" / ", parts);
+    }
+
+    public static String defaultTitle(NoteType type) {
+        if (type == NoteType.WORD) return UNTITLED_WORD;
+        if (type == NoteType.SHEET) return UNTITLED_SHEET;
+        if (type == NoteType.FOLDER) return "Nova pasta";
+        return UNTITLED;
     }
 
     public static String deriveTitle(String content) {
@@ -535,11 +572,31 @@ public final class NotesStore {
     }
 
     private void writeContent(String id, String content) throws IOException {
-        writeTextAtomic(contentPath(id), content == null ? "" : content);
+        writeTextAtomic(contentPath(id, NoteType.NOTE), content == null ? "" : content);
     }
 
-    private Path contentPath(String id) {
-        return contentDirectory.resolve(id + ".note");
+    private void writeBytes(Path target, byte[] content) throws IOException {
+        Path temporary = temporaryDirectory.resolve(target.getFileName() + "." + UUID.randomUUID() + ".tmp");
+        Files.write(temporary, content == null ? new byte[0] : content,
+                StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        moveAtomic(temporary, target);
+    }
+
+    private void deleteContent(NoteItem item) throws IOException {
+        if (!item.isNote()) return;
+        searchCache.remove(item.getId());
+        Files.deleteIfExists(contentPath(item));
+    }
+
+    private Path contentPath(NoteItem item) {
+        return contentPath(item.getId(), item.getType());
+    }
+
+    private Path contentPath(String id, NoteType type) {
+        if (type == null || type == NoteType.FOLDER) {
+            throw new IllegalArgumentException("O item nao possui conteudo: " + id);
+        }
+        return contentDirectory.resolve(id + type.extension());
     }
 
     private NotesIndex loadIndexRecovering() throws IOException {
@@ -550,6 +607,8 @@ public final class NotesStore {
         }
         try {
             return readIndex(indexFile);
+        } catch (IncompatibleIndexException newerVersion) {
+            throw newerVersion;
         } catch (IOException | DecodeSerializationException failure) {
             preserveCorrupt(indexFile);
             NotesIndex rebuilt = rebuildIndexFromContent();
@@ -562,7 +621,7 @@ public final class NotesStore {
         NotesIndex loaded = serializer.readAsObject(Files.readAllBytes(path), NotesIndex.class);
         if (loaded == null) throw new DecodeSerializationException("Indice vazio");
         if (loaded.getSchemaVersion() > SCHEMA_VERSION) {
-            throw new IOException("Versao de indice nao suportada: " + loaded.getSchemaVersion());
+            throw new IncompatibleIndexException(loaded.getSchemaVersion(), SCHEMA_VERSION);
         }
         loaded.getItems();
         return loaded;
@@ -578,26 +637,58 @@ public final class NotesStore {
 
     private NotesIndex rebuildIndexFromContent() throws IOException {
         NotesIndex rebuilt = new NotesIndex();
+        NotesIndex previous = index;
+        index = rebuilt;
         try (Stream<Path> files = Files.list(contentDirectory)) {
-            files.filter(path -> path.getFileName().toString().endsWith(".note")).sorted().forEach(path -> {
+            for (Path path : files.sorted().toList()) {
+                NoteType type = contentType(path.getFileName().toString());
+                if (type == null) continue;
                 try {
-                    String fileName = path.getFileName().toString();
-                    String id = fileName.substring(0, fileName.length() - ".note".length());
-                    try {
-                        UUID.fromString(id);
-                    } catch (IllegalArgumentException invalid) {
-                        id = UUID.randomUUID().toString();
-                        Files.move(path, contentPath(id), StandardCopyOption.REPLACE_EXISTING);
-                    }
-                    String content = Files.readString(path, StandardCharsets.UTF_8);
-                    NoteItem item = newItem(NoteType.NOTE, null, null, deriveTitle(content));
-                    item.setId(id);
-                    rebuilt.getItems().add(item);
+                    recoverContent(path, type);
                 } catch (IOException ignored) {
                 }
-            });
+            }
+        } finally {
+            index = previous;
         }
         return rebuilt;
+    }
+
+    private void recoverContent(Path path, NoteType type) throws IOException {
+        String fileName = path.getFileName().toString();
+        String id = fileName.substring(0, fileName.length() - type.extension().length());
+        try {
+            UUID.fromString(id);
+        } catch (IllegalArgumentException invalid) {
+            id = UUID.randomUUID().toString();
+            Path renamed = contentPath(id, type);
+            Files.move(path, renamed, StandardCopyOption.REPLACE_EXISTING);
+            path = renamed;
+        }
+        byte[] content = Files.readAllBytes(path);
+        String title;
+        if (type == NoteType.NOTE) {
+            title = deriveTitle(new String(content, StandardCharsets.UTF_8));
+        } else {
+            String text;
+            try {
+                text = NoteDocuments.searchableText(type, content);
+            } catch (IOException | RuntimeException unreadable) {
+                text = "";
+            }
+            String derived = deriveTitle(text);
+            title = UNTITLED.equals(derived) ? defaultTitle(type) : derived;
+        }
+        NoteItem item = newItem(type, null, null, title);
+        item.setId(id);
+        index.getItems().add(item);
+    }
+
+    private static NoteType contentType(String fileName) {
+        for (NoteType type : CONTENT_TYPES) {
+            if (fileName.endsWith(type.extension())) return type;
+        }
+        return null;
     }
 
     private NotesSessions readSessionsRecovering() {
@@ -678,9 +769,10 @@ public final class NotesStore {
         return normalized.substring(0, Math.min(80, normalized.length()));
     }
 
-    private static String conflictTitle(String title) {
-        String base = title == null || title.isBlank() ? UNTITLED : title;
-        return normalizeManualTitle(base + " (conflito " + CONFLICT_TIME.format(Instant.now()) + ")", UNTITLED);
+    private static String conflictTitle(String title, NoteType type) {
+        String base = title == null || title.isBlank() ? defaultTitle(type) : title;
+        return normalizeManualTitle(base + " (conflito " + CONFLICT_TIME.format(Instant.now()) + ")",
+                defaultTitle(type));
     }
 
     private static String normalizeSearch(String text) {
@@ -704,7 +796,20 @@ public final class NotesStore {
         T get() throws IOException;
     }
 
-    public record LoadedNote(NoteItem item, String content) {
+    public record LoadedNote(NoteItem item, byte[] data) {
+        public LoadedNote {
+            data = data == null ? new byte[0] : data;
+        }
+
+        public String content() {
+            return new String(data, StandardCharsets.UTF_8);
+        }
+    }
+
+    private record SearchText(long revision, FileTime modified, long size, String text) {
+        boolean matches(long otherRevision, FileTime otherModified, long otherSize) {
+            return revision == otherRevision && size == otherSize && Objects.equals(modified, otherModified);
+        }
     }
 
     public record SaveResult(NoteItem item, NoteItem conflictCopy) {

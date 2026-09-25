@@ -1,5 +1,6 @@
 package dtm.ide.plugins.notes.ui;
 
+import dtm.ide.plugins.notes.model.NoteType;
 import dtm.stools.theme.ThemeIcon;
 import dtm.stools.utils.ImageUtils;
 
@@ -10,6 +11,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class NotesIcons {
     public static final String NOTES = "notes";
     public static final String NOTE = "note";
+    public static final String WORD = "note-word";
+    public static final String SHEET = "note-sheet";
     public static final String NOTE_ADD = "note-add";
     public static final String FOLDER = "folder";
     public static final String FOLDER_ADD = "folder-add";
@@ -21,6 +24,13 @@ public final class NotesIcons {
 
     private NotesIcons() {
         throw new IllegalStateException("utility class");
+    }
+
+    public static Icon forType(NoteType type, int size) {
+        if (type == NoteType.FOLDER) return of(FOLDER, size);
+        if (type == NoteType.WORD) return of(WORD, size);
+        if (type == NoteType.SHEET) return of(SHEET, size);
+        return of(NOTE, size);
     }
 
     public static Icon of(String name, int size) {

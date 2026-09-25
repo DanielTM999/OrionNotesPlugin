@@ -1,15 +1,16 @@
 package dtm.ide.plugins.notes.ui;
 
 import dtm.ide.plugins.notes.model.NoteItem;
+import dtm.ide.plugins.notes.model.NoteType;
 import dtm.ide.plugins.notes.store.NotesStore;
 import dtm.stools.configs.UiTokens;
 import dtm.stools.component.tree.TreeDropContext;
 import dtm.stools.component.tree.TreeNode;
 import dtm.stools.component.tree.TreeView;
-
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
 import javax.swing.JLabel;
+import javax.swing.JMenu;
 import javax.swing.JMenuItem;
 import javax.swing.JPanel;
 import javax.swing.JPopupMenu;
@@ -104,11 +105,17 @@ public final class NotesPanel extends JPanel {
 
         JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, UiTokens.space(1), 0));
         buttons.setOpaque(false);
-        buttons.add(toolButton(
+        JButton newNote = toolButton(
                 NotesIcons.of(NotesIcons.NOTE_ADD, 17),
-                text("tooltip.newNote", "New note (Ctrl+Alt+N)"),
-                this::createNote
-        ));
+                text("tooltip.newNoteMenu", "New note: text (Ctrl+Alt+N), Word or spreadsheet"),
+                () -> { }
+        );
+        newNote.addActionListener(event -> {
+            JPopupMenu menu = new JPopupMenu();
+            addCreationItems(menu, this::createNote, this::importFromUi);
+            menu.show(newNote, 0, newNote.getHeight());
+        });
+        buttons.add(newNote);
         buttons.add(toolButton(
                 NotesIcons.of(NotesIcons.FOLDER_ADD, 17),
                 text("tooltip.newFolder", "New folder"),
@@ -248,8 +255,42 @@ public final class NotesPanel extends JPanel {
     }
 
     public void createNote() {
+        createNote(NoteType.NOTE);
+    }
+
+    public void createNote(NoteType type) {
         CreationTarget target = creationTarget();
-        actions.createNote(target.parentId(), target.projectId());
+        create(type, target.parentId(), target.projectId());
+    }
+
+    public void importFromUi() {
+        CreationTarget target = creationTarget();
+        actions.requestImport(target.parentId(), target.projectId());
+    }
+
+    private void create(NoteType type, String parentId, String projectId) {
+        if (type == null || type == NoteType.NOTE) actions.createNote(parentId, projectId);
+        else actions.requestCreateDocument(parentId, projectId, type);
+    }
+
+    private void addCreationItems(JPopupMenu menu, java.util.function.Consumer<NoteType> create, Runnable importFile) {
+        add(menu, text("button.newTextNote", "Text note"), NotesIcons.forType(NoteType.NOTE, 16),
+                event -> create.accept(NoteType.NOTE));
+        add(menu, text("button.newWord", "Word document"), NotesIcons.forType(NoteType.WORD, 16),
+                event -> create.accept(NoteType.WORD));
+        add(menu, text("button.newSheet", "Spreadsheet"), NotesIcons.forType(NoteType.SHEET, 16),
+                event -> create.accept(NoteType.SHEET));
+        menu.addSeparator();
+        add(menu, text("menu.import", "Import DOCX/XLSX..."), null, event -> importFile.run());
+    }
+
+    private void addCreationMenu(JPopupMenu menu, String parentId, String projectId) {
+        JMenu submenu = new JMenu(text("button.newNote", "New note"));
+        submenu.setIcon(NotesIcons.of(NotesIcons.NOTE_ADD, 16));
+        JPopupMenu popup = submenu.getPopupMenu();
+        addCreationItems(popup, type -> create(type, parentId, projectId),
+                () -> actions.requestImport(parentId, projectId));
+        menu.add(submenu);
     }
 
     public void createFolderFromUi() {
@@ -332,7 +373,7 @@ public final class NotesPanel extends JPanel {
 
     private TreeNode<Entry> itemNode(NoteItem item, String label) {
         TreeNode<Entry> node = node(new Entry(EntryKind.ITEM, item, label, item.getProjectId()), item.getId());
-        node.setIcon(NotesIcons.of(item.isFolder() ? NotesIcons.FOLDER : NotesIcons.NOTE, 16));
+        node.setIcon(NotesIcons.forType(item.getType(), 16));
         node.setDraggable(!item.isDeleted());
         node.setDropTarget(item.isFolder() && !item.isDeleted());
         node.setAlwaysParent(item.isFolder());
@@ -434,13 +475,13 @@ public final class NotesPanel extends JPanel {
         if (node == null || node.getData() == null) return menu;
         Entry entry = node.getData();
         if (entry.kind() == EntryKind.ROOT) {
-            add(menu, text("button.newNote", "New note"), event -> createNote());
+            CreationTarget target = creationTarget();
+            addCreationMenu(menu, target.parentId(), target.projectId());
             add(menu, text("button.newFolder", "New folder"), event -> createFolderFromUi());
             return menu;
         }
         if (entry.kind() == EntryKind.AREA) {
-            add(menu, text("button.newNote", "New note"),
-                    event -> actions.createNote(null, entry.projectId()));
+            addCreationMenu(menu, null, entry.projectId());
             add(menu, text("button.newFolder", "New folder"),
                     event -> actions.requestCreateFolder(null, entry.projectId()));
             return menu;
@@ -462,9 +503,11 @@ public final class NotesPanel extends JPanel {
             return menu;
         }
         if (item.isNote()) add(menu, text("menu.open", "Open"), event -> actions.openNote(item.getId()));
+        if (item.isDocument()) {
+            add(menu, text("menu.export", "Export copy..."), event -> actions.requestExport(item.getId()));
+        }
         if (item.isFolder()) {
-            add(menu, text("button.newNote", "New note"),
-                    event -> actions.createNote(item.getId(), item.getProjectId()));
+            addCreationMenu(menu, item.getId(), item.getProjectId());
             add(menu, text("button.newFolder", "New folder"),
                     event -> actions.requestCreateFolder(item.getId(), item.getProjectId()));
         }
@@ -478,13 +521,20 @@ public final class NotesPanel extends JPanel {
     }
 
     private void add(JPopupMenu menu, String label, java.awt.event.ActionListener listener) {
-        JMenuItem item = new JMenuItem(label);
+        add(menu, label, null, listener);
+    }
+
+    private void add(JPopupMenu menu, String label, javax.swing.Icon icon, java.awt.event.ActionListener listener) {
+        JMenuItem item = new JMenuItem(label, icon);
         item.addActionListener(listener);
         menu.add(item);
     }
 
     public interface Actions {
         void createNote(String parentId, String projectId);
+        void requestCreateDocument(String parentId, String projectId, NoteType type);
+        void requestImport(String parentId, String projectId);
+        void requestExport(String id);
         void requestCreateFolder(String parentId, String projectId);
         void openNote(String id);
         void requestRename(String id, String currentTitle);
