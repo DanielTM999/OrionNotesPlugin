@@ -11,6 +11,8 @@ import dtm.ide.plugins.notes.store.NoteDocuments;
 import dtm.ide.plugins.notes.store.NotesStore;
 import dtm.stools.component.panels.dock.DockRegion;
 import dtm.stools.component.panels.editor.code.CodeEditor;
+import dtm.stools.component.panels.editor.code.gutter.CodeEditorGutter;
+import dtm.stools.component.panels.editor.code.gutter.GutterRightClickListener;
 import dtm.stools.component.panels.editor.sheet.SheetEditor;
 import dtm.stools.component.panels.editor.word.WordEditor;
 import dtm.stools.component.panels.editor.word.model.WordDocument;
@@ -18,6 +20,9 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import javax.swing.Icon;
+import javax.swing.JCheckBoxMenuItem;
+import javax.swing.JMenu;
+import javax.swing.JPopupMenu;
 import javax.swing.JComponent;
 import javax.swing.SwingUtilities;
 import java.awt.Component;
@@ -45,6 +50,79 @@ class OrionNotesLifecycleTest {
 
     @TempDir
     Path shared;
+
+    @Test
+    void textAppearancePersistsAcrossTabsAndRestartAndReleasesGutterListeners() throws Exception {
+        NotesStore seed = new NotesStore(shared.resolve("orion-notes"));
+        NoteItem first = seed.createNote(null);
+        NoteItem second = seed.createNote(null);
+        HostedPlugin plugin = new HostedPlugin(shared, null);
+        plugin.onLoad();
+        try {
+            plugin.openNote(first.getId());
+            FakeTab tab = plugin.awaitTab(first.getId(), 1);
+            CodeEditor editor = find(tab.request.component(), CodeEditor.class);
+            onEdt(() -> {
+                List<GutterRightClickListener> listeners = gutterListeners(editor);
+                assertEquals(1, listeners.size());
+                // Aciona o menu real, sem precisar de uma janela da IDE.
+                var appearanceField = OrionNotesWindowPlugin.class.getDeclaredField("editors");
+                appearanceField.setAccessible(true);
+                Object session = ((java.util.Map<?, ?>) appearanceField.get(plugin)).get(first.getId());
+                var controllerField = session.getClass().getDeclaredField("appearance");
+                controllerField.setAccessible(true);
+                Object controller = controllerField.get(session);
+                var menuFactory = controller.getClass().getDeclaredMethod("createPopupMenu");
+                menuFactory.setAccessible(true);
+                JPopupMenu popup = (JPopupMenu) menuFactory.invoke(controller);
+                JMenu menu = (JMenu) popup.getComponent(0);
+                for (Component component : menu.getMenuComponents()) {
+                    if (component instanceof JCheckBoxMenuItem item && item.getText().equals("Wrap lines")) {
+                        item.doClick(0);
+                        break;
+                    }
+                }
+                assertTrue(editor.isLineWrapEnabled());
+                tab.close();
+                assertTrue(gutterListeners(editor).isEmpty());
+                return null;
+            });
+            // A leitura enfileirada da reabertura deve aguardar a gravacao da preferencia.
+            plugin.openNote(first.getId());
+            CodeEditor reopened = find(plugin.awaitTab(first.getId(), 2).request.component(), CodeEditor.class);
+            assertNotSame(editor, reopened);
+            assertTrue(onEdt(reopened::isLineWrapEnabled));
+            assertEquals(1, onEdt(() -> gutterListeners(reopened).size()));
+            plugin.openNote(second.getId());
+            CodeEditor other = find(plugin.awaitTab(second.getId(), 1).request.component(), CodeEditor.class);
+            assertFalse(onEdt(other::isLineWrapEnabled));
+        } finally {
+            plugin.onUnload();
+        }
+        for (FakeTab tab : plugin.tabs) {
+            assertTrue(onEdt(() -> gutterListeners(find(tab.request.component(), CodeEditor.class)).isEmpty()));
+        }
+        HostedPlugin restarted = new HostedPlugin(shared, null);
+        restarted.onLoad();
+        try {
+            restarted.openNote(first.getId());
+            CodeEditor editor = find(restarted.awaitTab(first.getId(), 1).request.component(), CodeEditor.class);
+            assertTrue(onEdt(editor::isLineWrapEnabled));
+            assertEquals(0, seed.find(first.getId()).orElseThrow().getRevision());
+            assertEquals("", seed.loadNote(first.getId()).content());
+        } finally {
+            restarted.onUnload();
+        }
+        assertEquals(List.of(), plugin.notifications);
+        assertEquals(List.of(), restarted.notifications);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<GutterRightClickListener> gutterListeners(CodeEditor editor) throws Exception {
+        var field = CodeEditorGutter.class.getDeclaredField("gutterRightClickListeners");
+        field.setAccessible(true);
+        return (List<GutterRightClickListener>) field.get(editor.getGutter());
+    }
 
     @Test
     void documentEditorsSurviveClosedTabsAndAreClosedOnlyOnUnload() throws Exception {

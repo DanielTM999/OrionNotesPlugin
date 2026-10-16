@@ -12,6 +12,8 @@ import dtm.ide.api.extension.screen.ManagedCenterTabRequest;
 import dtm.ide.api.extension.settings.PluginSettingsPage;
 import dtm.ide.api.plugin.PluginScope;
 import dtm.ide.plugins.notes.editor.DocumentNoteEditor;
+import dtm.ide.plugins.notes.editor.TextNoteAppearance;
+import dtm.ide.plugins.notes.model.NoteEditorAppearance;
 import dtm.ide.plugins.notes.model.NoteItem;
 import dtm.ide.plugins.notes.model.NoteType;
 import dtm.ide.plugins.notes.model.NotesSessionState;
@@ -159,6 +161,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         saveSessionNow();
         onEdt(() -> {
             for (EditorSession editor : List.copyOf(editors.values())) {
+                if (editor.appearance != null) editor.appearance.close();
                 if (editor.isDocument() && editor.closed.compareAndSet(false, true)) editor.document.close();
             }
             return null;
@@ -316,7 +319,8 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
                 NoteItem item = loaded.item();
                 if (item.isDeleted() || !isVisibleInProject(item, currentProjectId)) return;
                 if (!item.isDocument()) {
-                    SwingUtilities.invokeLater(() -> openLoadedNote(loaded));
+                    NoteEditorAppearance appearance = current.loadEditorAppearance(id);
+                    SwingUtilities.invokeLater(() -> openLoadedNote(loaded, appearance));
                     return;
                 }
                 EditorSession retained = editors.get(id);
@@ -660,7 +664,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         scheduleSessionSave();
     }
 
-    private void openLoadedNote(NotesStore.LoadedNote loaded) {
+    private void openLoadedNote(NotesStore.LoadedNote loaded, NoteEditorAppearance appearance) {
         if (shuttingDown || loaded == null) return;
         String noteId = loaded.item().getId();
         EditorSession existing = editors.get(noteId);
@@ -677,6 +681,16 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         }
         editor.setFocusBorderEnabled(false);
         EditorSession session = EditorSession.text(noteId, editor, loaded.item(), content);
+        session.appearance = new TextNoteAppearance(editor, appearance, this::text, (option, enabled) -> {
+            if (shuttingDown || session.closed.get()) return;
+            ioExecutor.execute(() -> {
+                try {
+                    store.setEditorAppearanceOption(noteId, option, enabled);
+                } catch (Exception failure) {
+                    notifyFailure("Nao foi possivel salvar a aparencia da nota", failure);
+                }
+            });
+        });
         DocumentEditListener listener = new DocumentEditListener() {
             @Override
             public void onTextChanged() {
@@ -692,6 +706,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         if (!showTab(session)) {
             editors.remove(noteId, session);
             editor.removeDocumentEditListener(listener);
+            session.appearance.close();
         }
     }
 
@@ -950,6 +965,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
 
     private void closeTextSession(EditorSession session) {
         if (session == null || !session.closed.compareAndSet(false, true)) return;
+        session.appearance.close();
         ScheduledFuture<?> pending = session.pendingSave;
         if (pending != null) pending.cancel(false);
         session.editor.removeDocumentEditListener(session.listener);
@@ -1234,6 +1250,7 @@ public class OrionNotesWindowPlugin extends IdeWindowAdapter implements NotesPan
         private volatile String pendingText;
         private volatile long revision;
         private volatile DocumentEditListener listener;
+        private TextNoteAppearance appearance;
         private volatile ManagedCenterTabHandle handle;
         private volatile Object tabToken;
         private volatile boolean tabOpen;

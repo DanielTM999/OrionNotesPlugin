@@ -4,6 +4,8 @@ import dtm.serialization.BinaryObjectSerializer;
 import dtm.serialization.exceptions.DecodeSerializationException;
 import dtm.serialization.mapper.BinaryObjectMapper;
 import dtm.ide.plugins.notes.model.NoteItem;
+import dtm.ide.plugins.notes.model.NoteEditorAppearance;
+import dtm.ide.plugins.notes.model.NotesEditorAppearances;
 import dtm.ide.plugins.notes.model.NoteType;
 import dtm.ide.plugins.notes.model.NotesIndex;
 import dtm.ide.plugins.notes.model.NotesSessionState;
@@ -60,6 +62,7 @@ public final class NotesStore {
     private final Path temporaryDirectory;
     private final Path indexFile;
     private final Path sessionFile;
+    private final Path editorAppearanceFile;
     private final Path lockFile;
     private final BinaryObjectSerializer serializer = new BinaryObjectMapper();
     private final ReentrantLock jvmLock;
@@ -73,6 +76,7 @@ public final class NotesStore {
         this.temporaryDirectory = this.root.resolve("tmp");
         this.indexFile = this.root.resolve("index.bin");
         this.sessionFile = this.root.resolve("session.bin");
+        this.editorAppearanceFile = this.root.resolve("editor-appearance.bin");
         this.lockFile = this.root.resolve("store.lock");
         this.jvmLock = JVM_LOCKS.computeIfAbsent(this.root, ignored -> new ReentrantLock());
         this.index = new NotesIndex();
@@ -257,9 +261,7 @@ public final class NotesStore {
             if (removed.stream().anyMatch(item -> !item.isDeleted())) {
                 throw new IllegalStateException("Somente itens da lixeira podem ser excluidos definitivamente");
             }
-            for (NoteItem item : removed) {
-                deleteContent(item);
-            }
+            deleteContents(removed);
             Set<String> removedIds = removed.stream().map(NoteItem::getId).collect(java.util.stream.Collectors.toSet());
             index.getItems().removeIf(item -> removedIds.contains(item.getId()));
             return null;
@@ -269,9 +271,7 @@ public final class NotesStore {
     public void emptyTrash() throws IOException {
         mutate(() -> {
             List<NoteItem> removed = index.getItems().stream().filter(NoteItem::isDeleted).toList();
-            for (NoteItem item : removed) {
-                deleteContent(item);
-            }
+            deleteContents(removed);
             index.getItems().removeIf(NoteItem::isDeleted);
             return null;
         });
@@ -284,9 +284,7 @@ public final class NotesStore {
                     .filter(NoteItem::isDeleted)
                     .filter(item -> Objects.equals(normalizedProjectId, item.getProjectId()))
                     .toList();
-            for (NoteItem item : removed) {
-                deleteContent(item);
-            }
+            deleteContents(removed);
             Set<String> removedIds = removed.stream().map(NoteItem::getId)
                     .collect(java.util.stream.Collectors.toSet());
             index.getItems().removeIf(item -> removedIds.contains(item.getId()));
@@ -308,9 +306,7 @@ public final class NotesStore {
                     .filter(item -> isExpired(item, cutoff))
                     .toList();
             if (removed.isEmpty()) return 0;
-            for (NoteItem item : removed) {
-                deleteContent(item);
-            }
+            deleteContents(removed);
             Set<String> removedIds = removed.stream().map(NoteItem::getId)
                     .collect(java.util.stream.Collectors.toSet());
             index.getItems().removeIf(item -> removedIds.contains(item.getId()));
@@ -416,6 +412,29 @@ public final class NotesStore {
             NotesSessions sessions = readSessionsRecovering();
             NotesSessionState state = sessions.getContexts().get(contextKey(context));
             return state == null ? new NotesSessionState() : state.copy();
+        });
+    }
+
+    public NoteEditorAppearance loadEditorAppearance(String noteId) throws IOException {
+        return withFileLock(() -> {
+            NoteEditorAppearance appearance = readEditorAppearancesRecovering().getNotes().get(noteId);
+            return appearance == null ? new NoteEditorAppearance() : appearance.copy();
+        });
+    }
+
+    /** Atualiza apenas uma opcao, preservando alteracoes feitas por outras janelas. */
+    public void setEditorAppearanceOption(String noteId, String option, boolean enabled) throws IOException {
+        Objects.requireNonNull(option, "option");
+        withFileLock(() -> {
+            index = Files.exists(indexFile) ? readIndex(indexFile) : new NotesIndex();
+            NoteItem item = findInternal(noteId).orElse(null);
+            // Uma gravacao enfileirada nao deve recriar preferencias de uma nota ja excluida.
+            if (item == null || !item.isTextNote()) return null;
+            NotesEditorAppearances appearances = readEditorAppearancesRecovering();
+            appearances.getNotes().computeIfAbsent(noteId, ignored -> new NoteEditorAppearance())
+                    .getOptions().put(option, enabled);
+            writeBinaryAtomic(editorAppearanceFile, appearances);
+            return null;
         });
     }
 
@@ -582,10 +601,21 @@ public final class NotesStore {
         moveAtomic(temporary, target);
     }
 
-    private void deleteContent(NoteItem item) throws IOException {
-        if (!item.isNote()) return;
-        searchCache.remove(item.getId());
-        Files.deleteIfExists(contentPath(item));
+    private void deleteContents(List<NoteItem> removed) throws IOException {
+        if (removed.isEmpty()) return;
+        if (Files.exists(editorAppearanceFile)) {
+            NotesEditorAppearances appearances = readEditorAppearancesRecovering();
+            boolean changed = false;
+            for (NoteItem item : removed) {
+                changed |= appearances.getNotes().remove(item.getId()) != null;
+            }
+            if (changed) writeBinaryAtomic(editorAppearanceFile, appearances);
+        }
+        for (NoteItem item : removed) {
+            if (!item.isNote()) continue;
+            searchCache.remove(item.getId());
+            Files.deleteIfExists(contentPath(item));
+        }
     }
 
     private Path contentPath(NoteItem item) {
@@ -702,6 +732,22 @@ public final class NotesStore {
             try { preserveCorrupt(sessionFile); } catch (IOException ignored) { }
             return new NotesSessions();
         }
+    }
+
+    private NotesEditorAppearances readEditorAppearancesRecovering() throws IOException {
+        if (!Files.exists(editorAppearanceFile)) return new NotesEditorAppearances();
+        NotesEditorAppearances appearances;
+        try {
+            appearances = serializer.readAsObject(Files.readAllBytes(editorAppearanceFile), NotesEditorAppearances.class);
+        } catch (IOException | DecodeSerializationException failure) {
+            preserveCorrupt(editorAppearanceFile);
+            return new NotesEditorAppearances();
+        }
+        if (appearances == null) return new NotesEditorAppearances();
+        if (appearances.getSchemaVersion() > 1) {
+            throw new IOException("Preferencias de aparencia criadas por uma versao mais recente do Orion Notes");
+        }
+        return appearances;
     }
 
     private void preserveCorrupt(Path path) throws IOException {

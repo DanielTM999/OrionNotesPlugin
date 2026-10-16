@@ -48,6 +48,7 @@ Abra `Ferramentas > Notas > Abrir notas`. O painel **Notas** será exibido à di
 - Use os botões no topo do painel para criar uma nota (texto, Word ou planilha) ou uma pasta. Documentos Word e planilhas pedem um nome ao serem criados; notas de texto recebem o título da primeira linha.
 - Selecione **Global**, o projeto atual ou uma de suas pastas para escolher o destino; sem seleção, vale a preferência configurada.
 - Dê dois cliques em uma nota para abri-la no editor.
+- Nas notas de texto, clique com o botão direito no gutter (margem dos números de linha) e abra **Aparência** para ativar a **Quebra automática de linha** e outras opções visuais. As preferências são salvas por nota, inclusive após reiniciar a IDE; a quebra é apenas visual e não altera o texto.
 - Clique com o botão direito em um item para renomear, exportar uma cópia, restaurar ou mover para a lixeira.
 - Use **Importar DOCX/XLSX...** para adicionar uma cópia de um arquivo existente como nova nota. O arquivo original não é alterado.
 - Arraste notas e pastas para reorganizá-las.
